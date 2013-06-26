@@ -1,8 +1,8 @@
 %%%----------------------------------------------------------------------
-%%% File      : akita.erl
+%%% File      : akita_sup.erl
 %%% Author    : ryan.ruan@ericsson.com
-%%% Purpose   : Bootstrap module.
-%%% Created   : Apr 3, 2013
+%%% Purpose   : Erlang application supervisor.
+%%% Created   : Jun 26, 2013
 %%%----------------------------------------------------------------------
 
 %%%----------------------------------------------------------------------
@@ -20,30 +20,29 @@
 %%% under the License.
 %%%----------------------------------------------------------------------
 
--module(akita).            
+-module(akita_sup).
 
-%% API Functions
--export([start/0, stop/0]).
+-behaviour(supervisor).
 
-%% ===================================================================
-%% API Functions
-%% ===================================================================
-start() ->
-    ensure_started(crypto),
-    ensure_started(sasl),
-    application:start(akita).
+%% Helper Macro For Declaring Children Of Supervisor
+-define(CHILD(I, Type), {I, {I, start_link, []}, permanent, 5000, Type, [I]}).
 
-stop() ->
-    application:stop(akita).
+%% Behaviour Callbacks
+-export([start_link/0]).
+
+%% Supervisor Callbacks
+-export([init/1]).
 
 %% ===================================================================
-%% Inner Functions
+%% API functions
 %% ===================================================================
-ensure_started(App) ->
-    case application:start(App) of
-        ok ->
-            ok;
-        {error, {already_started, App}}
-        ->
-            ok
-    end.
+start_link() ->
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
+
+%% ===================================================================
+%% Supervisor Callbacks
+%% ===================================================================
+init([]) ->
+    AkitaWorker  = ?CHILD(akita_cluster_info, worker),
+    Specs        = [AkitaWorker],
+    {ok, {{one_for_one, 5, 10}, Specs}}.

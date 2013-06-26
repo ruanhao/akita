@@ -1,8 +1,8 @@
 %%%----------------------------------------------------------------------
-%%% File      : akita.erl
+%%% File      : akita_app.erl
 %%% Author    : ryan.ruan@ericsson.com
-%%% Purpose   : Bootstrap module.
-%%% Created   : Apr 3, 2013
+%%% Purpose   : Erlang application entry module.
+%%% Created   : Jun 26, 2013
 %%%----------------------------------------------------------------------
 
 %%%----------------------------------------------------------------------
@@ -20,30 +20,18 @@
 %%% under the License.
 %%%----------------------------------------------------------------------
 
--module(akita).            
+-module(akita_app).
+
+-behaviour(application).
 
 %% API Functions
--export([start/0, stop/0]).
+-export([start/2, stop/1]).
 
 %% ===================================================================
 %% API Functions
 %% ===================================================================
-start() ->
-    ensure_started(crypto),
-    ensure_started(sasl),
-    application:start(akita).
+start(_StartType, _StartArgs) ->
+    akita_sup:start_link().
 
-stop() ->
-    application:stop(akita).
-
-%% ===================================================================
-%% Inner Functions
-%% ===================================================================
-ensure_started(App) ->
-    case application:start(App) of
-        ok ->
-            ok;
-        {error, {already_started, App}}
-        ->
-            ok
-    end.
+stop(_State) ->
+    ok.

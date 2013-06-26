@@ -3,3 +3,8 @@ deps
 *.o
 *.beam
 *.plt
+.project
+.settings
+*.dump
+log
+ebin
