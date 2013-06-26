@@ -1,0 +1,1 @@
+-module(akita_collector_local).
