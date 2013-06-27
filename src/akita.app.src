@@ -1,7 +1,9 @@
 {application, akita,
     [{description, "Erlang Cluster Info Recorder"},
     {vsn, "0.1.0"}, 
+    {modules, [akita, akita_app, akita_cluster_info, akita_collector_local, akita_sup]},
     {registered, []},
-    {applications, [kernel, stdlib]},           
+    {applications, [kernel, stdlib]},
+    {registered, [akita_cluster_info, akita_collector_local]},
     {mod, {akita_app, []}},
     {env, []}]}.
