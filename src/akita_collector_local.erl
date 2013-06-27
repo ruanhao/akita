@@ -4,6 +4,7 @@
 -define(AKITA_FILE, filename:join(home(), "akita.record." ++ atom_to_list(node()))).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 -export([start/0]).
+-record(state, {}).
 
 %% ====================================================================
 %% API functions
@@ -16,7 +17,6 @@ start() ->
 %% ====================================================================
 %% Behavioural functions 
 %% ====================================================================
--record(state, {}).
 
 %% init/1
 %% ====================================================================
@@ -30,8 +30,9 @@ start() ->
     Timeout :: non_neg_integer() | infinity.
 %% ====================================================================
 init([]) ->
-    process_flag(trap_exit, true),
+    %%process_flag(trap_exit, true),
     init_dets_file(),
+    io:format("dic: ~w~n", [get()]),
     {ok, #state{}}.
 
 
@@ -81,6 +82,7 @@ handle_cast(Msg, State) ->
     Timeout :: non_neg_integer() | infinity.
 %% =========================================================================
 handle_info(Info, State) ->
+    io:format("Info: ~w~n", [Info]),
     {noreply, State}.
 
 
