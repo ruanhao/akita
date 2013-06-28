@@ -23,10 +23,12 @@
 -module(akita_cluster_info).
 -behaviour(gen_server).
 
--record(state, {}).
+-record(state, {nodes, failed}).
 
 -include_lib("stdlib/include/ms_transform.hrl").
 -define(TOP_N, 30).
+-define(CENTRAL_NODE, 'hello@hao').
+-define(TIMEOUT, 15000).
 
 %% API Function
 -export([start_link/0]).
@@ -44,9 +46,13 @@ start_link() ->
 %% Behaviour Callbacks
 %% ------------------------------------------------------------------
 init([]) ->
+    %% if canine framework is used, there is no need to 'connect_all'
+    connect_all(),
+    %% in order to call terminate when application stops
+    process_flag(trap_exit, true),
     c:nl(akita_collector_local),
-    rpc:multicall(akita_collector_local, start, []),
-    {ok, #state{}}.
+    init_det_files(),
+    {ok, #state{nodes = get(nodes), failed = 0}, ?TIMEOUT}.
 
 handle_call(_Request, _From, State) ->
     {noreply, ok, State}.
@@ -54,12 +60,35 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info(_Info, State) ->
-    io:format("receive info: ~w~n", [_Info]),
+handle_info(timeout, #state{nodes = Failed} = State) -> 
+    io:format("no response from theses nodes: ~w~n", [Failed]),
+    {stop, no_response, State};
+handle_info({init_dets, {Node, Status}}, #state{nodes = Nodes, failed = Failed}) -> 
+    io:format("initializaiton on node ~w --- ~w ~n", [Node, Status]),
+    NodesLeft = Nodes -- [Node],
+    TotalFailedNow = case Status of
+        ok   -> Failed;
+        fail -> Failed + 1
+    end,
+    if 
+        NodesLeft =:= [] -> 
+            if 
+                TotalFailedNow > 0 -> 
+                    {stop, init_fail, #state{nodes = NodesLeft, failed = TotalFailedNow}};
+                true               -> 
+                    application:set_env(akita, cluster_info_start, true), 
+                    {noreply, #state{nodes = NodesLeft}}
+            end;
+        true             -> 
+            {noreply, #state{nodes = NodesLeft, failed = TotalFailedNow}, ?TIMEOUT}
+    end;
+handle_info(Info, State) ->
+    io:format("receive unexpected info: ~w~n", [Info]),
     {noreply, State}.
 
-terminate(_Reason, _State) ->
-    io:format("terminate with reason: ~w~n", [_Reason]),
+terminate(Reason, _State) ->
+    mesh_unload(),
+    io:format("akita terminated with reason: ~w~n", [Reason]),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -132,3 +161,23 @@ generate_entry() ->
     AllProcsInfo             = dump_all_proc(),
     {Epoch, Core, CpuUtil, MemUtil, ErlangProcsMemTopList, ErlangProcsRedTopList,
         ErlangProcsMqToplist, AllProcsInfo}.
+
+mesh_unload() -> 
+    todo.
+
+%% this method should be improved
+connect_all() -> 
+    net_kernel:connect_node(?CENTRAL_NODE),
+    OtherNodes = rpc:call(?CENTRAL_NODE, erlang, nodes, []),
+    [ net_kernel:connect_node(N) || N <- OtherNodes ],
+    io:format("connect to all --- ok~n", []),
+    put(nodes, [?CENTRAL_NODE | OtherNodes]).
+
+init_det_files() -> 
+    {ok, Flag} = application:get_env(akita, cluster_info_start),
+    if 
+        not Flag -> 
+            [ spawn(Node, akita_collector_local, init, []) || Node <- get(nodes) ];
+        true     -> 
+            ok
+    end.
