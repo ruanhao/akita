@@ -23,10 +23,8 @@
 -module(akita_cluster_info).
 -behaviour(gen_server).
 
--record(state, {nodes, failed}).
+-record(state, {nodes}).
 
--include_lib("stdlib/include/ms_transform.hrl").
--define(TOP_N, 30).
 -define(CENTRAL_NODE, 'hello@hao').
 -define(TIMEOUT, 15000).
 
@@ -51,8 +49,8 @@ init([]) ->
     %% in order to call terminate when application stops
     process_flag(trap_exit, true),
     c:nl(akita_collector_local),
-    init_det_files(),
-    {ok, #state{nodes = get(nodes), failed = 0}, ?TIMEOUT}.
+    timer:send_after(1000, do_init),
+    {ok, #state{nodes = get(nodes)}, ?TIMEOUT}.
 
 handle_call(_Request, _From, State) ->
     {noreply, ok, State}.
@@ -60,33 +58,66 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info(timeout, #state{nodes = Failed} = State) -> 
-    io:format("no response from theses nodes: ~w~n", [Failed]),
-    {stop, no_response, State};
-handle_info({init_dets, {Node, Status}}, #state{nodes = Nodes, failed = Failed}) -> 
+handle_info(timeout, #state{nodes = [H | _]}) -> 
+    io:format("no response from node: ~w~n", [H]),
+    {stop, no_response, #state{}};
+
+handle_info(do_init, #state{nodes = Nodes} = State) -> 
+    spawn_init_proc(Nodes),
+    {noreply,State, ?TIMEOUT}; 
+
+handle_info({init_dets, {Node, Status}}, #state{nodes = [_ | L]}) -> 
     io:format("initializaiton on node ~w --- ~w ~n", [Node, Status]),
-    NodesLeft = Nodes -- [Node],
-    TotalFailedNow = case Status of
-        ok   -> Failed;
-        fail -> Failed + 1
-    end,
-    if 
-        NodesLeft =:= [] -> 
+    case Status of 
+        fail -> 
+            {stop, init_fail, #state{}};
+        ok -> 
             if 
-                TotalFailedNow > 0 -> 
-                    {stop, init_fail, #state{nodes = NodesLeft, failed = TotalFailedNow}};
-                true               -> 
-                    application:set_env(akita, cluster_info_start, true), 
-                    {noreply, #state{nodes = NodesLeft}}
-            end;
-        true             -> 
-            {noreply, #state{nodes = NodesLeft, failed = TotalFailedNow}, ?TIMEOUT}
+                L =:= [] -> 
+                    application:set_env(akita, cluster_info_start, true),
+                    {noreply, #state{}};
+                true     -> 
+                    spawn_init_proc(L),
+                    {noreply, #state{nodes = L}, ?TIMEOUT}
+            end
     end;
+
+handle_info({'DOWN', _Ref, process, Pid, _Info}, State) -> 
+    [{Node, _M, Pid}] = [{N, M, P} || {N, M, P} <- get(workers), P =:= Pid ],
+    delete_worker(Pid),
+    NewPid = proc_lib:spawn(Node, akita_collector_local, start_collect_local, []),
+    MonitorRef = erlang:monitor(process, Pid),
+    add_worker({Node, MonitorRef, NewPid}),
+    {noreply, State};
+
+handle_info(dump_cluster_info, State) -> 
+    Filename = filename:join(home(), "dump"),
+    {ok, Fd} = file:open(Filename, write),
+    Workers = get(workers),
+    io:format(Fd, "===============================================~n", []),
+    [begin
+        io:format(Fd, "cluster info on ~w: ~n",[N]),
+        Res = rpc:call(N, akita_collector_local, read_all, []),
+        io:format(Fd, "~p~n", [Res]),
+        io:format(Fd, "~n~n~n", [])
+        end || {N, _M, _P} <- Workers ],
+    file:close(Fd),
+    {noreply, State};
+
+handle_info(stop_collect, State) -> 
+    stop_collect(),
+    {noreply, State};
+
+handle_info(start_collect, State) -> 
+    do_collect(),
+    {noreply, State};
+
 handle_info(Info, State) ->
     io:format("receive unexpected info: ~w~n", [Info]),
     {noreply, State}.
 
 terminate(Reason, _State) ->
+    stop_collect(),
     mesh_unload(),
     io:format("akita terminated with reason: ~w~n", [Reason]),
     ok.
@@ -98,72 +129,20 @@ code_change(_OldVsn, State, _Extra) ->
 %% Inner Functions
 %% ------------------------------------------------------------------
 
-akita_insert(V) when is_tuple(V) -> 
-    dets:insert(?MODULE, V);
-akita_insert(_)                  -> 
-    io:format("only tuple can be inserted~n", []).
-
-period_collect() -> 
-    akita_insert(generate_entry()),
-    receive
-        stop -> dets:close(?MODULE)
-    after
-        60   -> period_collect()
-    end.
-
-akita_read_all() -> 
-    dets:select(?MODULE, ets:fun2ms(fun(T) -> T end)). 
-
-epoch() -> 
-    calendar:datetime_to_gregorian_seconds(calendar:universal_time())-719528*24*3600.
-
-beam_pid() -> 
-    os:getpid().
-
-ps_info() -> 
-    Cmd = "ps -eo pid,psr,pcpu,pmem | egrep '^\\s*" ++ beam_pid() ++ "\\b'",
-    Res = os:cmd(Cmd),
-    [_Pid, CoreStr, CpuUtilStr, MemUtilStr] = string:tokens(Res, "\n\s"),
-    Core    = list_to_integer(CoreStr),
-    CpuUtil = list_to_float(CpuUtilStr),
-    MemUtil = list_to_float(MemUtilStr),
-    {Core, CpuUtil, MemUtil}.
-
-get_proc_attr(Proc, Attr) when is_pid(Proc) -> 
-    case catch process_info(Proc, Attr) of 
-        {'EXIT', _} -> -9999;
-        {Attr  , V} -> V
-    end.
-
-compare(A, B, Attr) -> 
-    compare(A, B, Attr, down).
-compare(A, B, Attr, Direction) -> 
-    [V1, V2] = [ get_proc_attr(P, Attr) || P <- [A, B] ],
-    case Direction of 
-        down -> V1 > V2;
-        up   -> V1 < V2
-    end.
-
-top_procs(Procs, Attr) -> 
-    L = lists:sort(fun(A, B) -> compare(A, B, Attr) end, Procs),
-    lists:sublist(L, ?TOP_N).
-
-dump_all_proc() -> 
-    [ {P, process_info(P)} || P <- processes() ].
-
-generate_entry() -> 
-    {Core, CpuUtil, MemUtil} = ps_info(),
-    Epoch                    = epoch(),
-    Procs                    = processes(),
-    ErlangProcsMemTopList    = top_procs(Procs, memory),
-    ErlangProcsRedTopList    = top_procs(Procs, reductions),
-    ErlangProcsMqToplist     = top_procs(Procs, message_queue_len),
-    AllProcsInfo             = dump_all_proc(),
-    {Epoch, Core, CpuUtil, MemUtil, ErlangProcsMemTopList, ErlangProcsRedTopList,
-        ErlangProcsMqToplist, AllProcsInfo}.
+stop_collect() -> 
+    Workers = get(workers),
+    [begin
+        erlang:demonitor(M),
+        timer:sleep(100),
+        P ! stop
+        end || {_N, M, P} <- Workers ].
 
 mesh_unload() -> 
-    todo.
+    Workers = get(workers),
+    [begin
+        rpc:call(N, code, delete, [akita_collector_local])
+        end || {N, _M, _P} <- Workers ].
+
 
 %% this method should be improved
 connect_all() -> 
@@ -173,11 +152,28 @@ connect_all() ->
     io:format("connect to all --- ok~n", []),
     put(nodes, [?CENTRAL_NODE | OtherNodes]).
 
-init_det_files() -> 
-    {ok, Flag} = application:get_env(akita, cluster_info_start),
-    if 
-        not Flag -> 
-            [ spawn(Node, akita_collector_local, init, []) || Node <- get(nodes) ];
-        true     -> 
-            ok
+spawn_init_proc([H | _]) -> 
+    proc_lib:spawn(H, akita_collector_local, init, []).
+
+add_worker(W) -> 
+    case get(workers) of 
+        undefined -> put(workers, [W]);
+        Workers   -> put(workers, [W | Workers])
     end.
+
+delete_worker(Pid) -> 
+    Workers = get(workers),
+    Worker = [ {N, M, P} || {N, M, P} <- Workers, P =:= Pid ], 
+    put(workers, Workers -- Worker).
+
+do_collect() -> 
+    Nodes = get(nodes),
+    [begin
+                Pid = proc_lib:spawn(N, akita_collector_local, start_collect_local, []),
+                MonitorRef = erlang:monitor(process, Pid),
+                add_worker({N, MonitorRef, Pid})
+        end || N <- Nodes].
+home() -> 
+    {ok, [[HOME]]} = init:get_argument(home),
+    HOME.
+

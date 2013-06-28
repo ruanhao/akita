@@ -23,7 +23,7 @@
 -module(akita).            
 
 %% API Functions
--export([start/0, stop/0]).
+-export([start/0, stop/0, start_collect/0, stop_collect/0, dump_cluster_info/0]).
 
 %% ===================================================================
 %% API Functions
@@ -35,6 +35,16 @@ start() ->
 
 stop() ->
     application:stop(akita).
+
+start_collect() -> 
+    global:send(akita_cluster_info, start_collect).
+
+stop_collect() -> 
+    global:send(akita_cluster_info, stop_collect).
+
+dump_cluster_info() -> 
+    global:send(akita_cluster_info, dump_cluster_info).
+
 
 %% ===================================================================
 %% Inner Functions
