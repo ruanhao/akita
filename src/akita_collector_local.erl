@@ -10,6 +10,7 @@
 %% API functions
 %% ====================================================================
 init() -> 
+    io:format("do initialization on ~w~n", [node()]),
     Existed = filelib:is_file(?AKITA_FILE),
     if 
         Existed -> 
@@ -17,6 +18,7 @@ init() ->
         true    ->
             ok
     end,
+    io:format("creating dets file ~p~n", [?AKITA_FILE]),
     case catch dets:open_file(?MODULE, [{file, ?AKITA_FILE}]) of 
         {ok, ?MODULE} -> 
             dets:close(?MODULE),
@@ -112,8 +114,14 @@ generate_entry() ->
     ErlangProcsRedTopList    = top_procs(Procs, reductions),
     ErlangProcsMqToplist     = top_procs(Procs, message_queue_len),
     AllProcsInfo             = dump_all_proc(),
-    {Epoch, Core, CpuUtil, MemUtil, ErlangProcsMemTopList, ErlangProcsRedTopList,
-        ErlangProcsMqToplist, AllProcsInfo}.
+    {   {epoch, Epoch}, 
+        {core, Core}, 
+        {cpu_util, CpuUtil}, 
+        {mem_util, MemUtil}, 
+        {mem_toplist, ErlangProcsMemTopList}, 
+        {red_toplist, ErlangProcsRedTopList},
+        {mq_toplist, ErlangProcsMqToplist}, 
+        {procs_info, AllProcsInfo}}.
 
 read_all() -> 
     dets:open_file(?MODULE, [{file, ?AKITA_FILE}]),

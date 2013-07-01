@@ -25,8 +25,8 @@
 
 -record(state, {nodes}).
 
--define(CENTRAL_NODE, 'hello@hao').
--define(TIMEOUT, 15000).
+-define(CENTRAL_NODE, 'hello@Hao').
+-define(TIMEOUT, 150000).
 
 %% API Function
 -export([start_link/0]).
@@ -44,6 +44,7 @@ start_link() ->
 %% Behaviour Callbacks
 %% ------------------------------------------------------------------
 init([]) ->
+    io:format("initialization begins~n", []),
     %% if canine framework is used, there is no need to 'connect_all'
     connect_all(),
     %% in order to call terminate when application stops
@@ -63,8 +64,14 @@ handle_info(timeout, #state{nodes = [H | _]}) ->
     {stop, no_response, #state{}};
 
 handle_info(do_init, #state{nodes = Nodes} = State) -> 
-    spawn_init_proc(Nodes),
-    {noreply,State, ?TIMEOUT}; 
+    case application:get_env(akita, cluster_info_start) of 
+        {ok, false} -> 
+            io:format("start to init on local nodes~n", []),
+            spawn_init_proc(Nodes), 
+            {noreply, State, ?TIMEOUT}; 
+        {ok, true}  -> 
+            {noreply, State}
+    end;
 
 handle_info({init_dets, {Node, Status}}, #state{nodes = [_ | L]}) -> 
     io:format("initializaiton on node ~w --- ~w ~n", [Node, Status]),
@@ -91,21 +98,23 @@ handle_info({'DOWN', _Ref, process, Pid, _Info}, State) ->
     {noreply, State};
 
 handle_info(dump_cluster_info, State) -> 
-    Filename = filename:join(home(), "dump"),
+    Filename = filename:join(home(), "akita.dump"),
     {ok, Fd} = file:open(Filename, write),
     Workers = get(workers),
     io:format(Fd, "===============================================~n", []),
     [begin
-        io:format(Fd, "cluster info on ~w: ~n",[N]),
+        io:format(Fd, "=========== akita cluster info on ~w begins to dump ===============~n",[N]),
         Res = rpc:call(N, akita_collector_local, read_all, []),
         io:format(Fd, "~p~n", [Res]),
+        io:format(Fd, "=========== akita cluster info on ~w dumps over ===============~n",[N]),
         io:format(Fd, "~n~n~n", [])
         end || {N, _M, _P} <- Workers ],
     file:close(Fd),
+    io:format("dump ok~n", []),
     {noreply, State};
 
 handle_info(stop_collect, State) -> 
-    stop_collect(),
+    stop_collect(get(workers)),
     {noreply, State};
 
 handle_info(start_collect, State) -> 
@@ -117,9 +126,15 @@ handle_info(Info, State) ->
     {noreply, State}.
 
 terminate(Reason, _State) ->
-    stop_collect(),
-    mesh_unload(),
+    case get(workers) of 
+        undefined -> 
+            ok;
+        Workers  -> 
+            stop_collect(Workers),
+            mesh_unload(Workers)
+    end,
     io:format("akita terminated with reason: ~w~n", [Reason]),
+    application:set_env(akita, cluster_info_start, false),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -129,16 +144,14 @@ code_change(_OldVsn, State, _Extra) ->
 %% Inner Functions
 %% ------------------------------------------------------------------
 
-stop_collect() -> 
-    Workers = get(workers),
+stop_collect(Workers) -> 
     [begin
         erlang:demonitor(M),
         timer:sleep(100),
         P ! stop
         end || {_N, M, P} <- Workers ].
 
-mesh_unload() -> 
-    Workers = get(workers),
+mesh_unload(Workers) -> 
     [begin
         rpc:call(N, code, delete, [akita_collector_local])
         end || {N, _M, _P} <- Workers ].
@@ -149,9 +162,13 @@ connect_all() ->
     net_kernel:connect_node(?CENTRAL_NODE),
     OtherNodes = rpc:call(?CENTRAL_NODE, erlang, nodes, []),
     [ net_kernel:connect_node(N) || N <- OtherNodes ],
-    io:format("connect to all --- ok~n", []),
-    put(nodes, [?CENTRAL_NODE | OtherNodes]).
+    ClusterNodes = [?CENTRAL_NODE | OtherNodes],
+    io:format("connect to all nodes (~w) --- ok~n", [ClusterNodes]),
+    put(nodes, ClusterNodes).
 
+spawn_init_proc([]) -> 
+    io:format("Erlang cluster not available~n", []),
+    exit('cluster_not_available');
 spawn_init_proc([H | _]) -> 
     proc_lib:spawn(H, akita_collector_local, init, []).
 

@@ -29,20 +29,26 @@
 %% API Functions
 %% ===================================================================
 start() ->
+    io:format("~n", []),
     ensure_started(crypto),
     ensure_started(sasl),
+    io:format("starting akita~n", []),
     application:start(akita).
 
 stop() ->
+    io:format("~n", []),
     application:stop(akita).
 
 start_collect() -> 
+    io:format("~n", []),
     global:send(akita_cluster_info, start_collect).
 
 stop_collect() -> 
+    io:format("~n", []),
     global:send(akita_cluster_info, stop_collect).
 
 dump_cluster_info() -> 
+    io:format("~n", []),
     global:send(akita_cluster_info, dump_cluster_info).
 
 
