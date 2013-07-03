@@ -25,7 +25,7 @@
 
 -record(state, {nodes}).
 
--define(CENTRAL_NODE, 'hello@Hao').
+-define(CENTRAL_NODE, 'hello@hao').
 -define(TIMEOUT, 150000).
 
 %% API Function
@@ -49,7 +49,7 @@ init([]) ->
     connect_all(),
     %% in order to call terminate when application stops
     process_flag(trap_exit, true),
-    c:nl(akita_collector_local),
+    load_module(akita_collector_local),
     timer:send_after(1000, do_init),
     {ok, #state{nodes = get(nodes)}, ?TIMEOUT}.
 
@@ -74,7 +74,7 @@ handle_info(do_init, #state{nodes = Nodes} = State) ->
     end;
 
 handle_info({init_dets, {Node, Status}}, #state{nodes = [_ | L]}) -> 
-    io:format("initializaiton on node ~w --- ~w ~n", [Node, Status]),
+    io:format("initializaiton on node ~w ------ ~w ~n", [Node, Status]),
     case Status of 
         fail -> 
             {stop, init_fail, #state{}};
@@ -101,8 +101,8 @@ handle_info(dump_cluster_info, State) ->
     Filename = filename:join(home(), "akita.dump"),
     {ok, Fd} = file:open(Filename, write),
     Workers = get(workers),
-    io:format(Fd, "===============================================~n", []),
     [begin
+        io:format("dumping cluster info on ~w~n", [N]),
         io:format(Fd, "=========== akita cluster info on ~w begins to dump ===============~n",[N]),
         Res = rpc:call(N, akita_collector_local, read_all, []),
         io:format(Fd, "~p~n", [Res]),
@@ -157,20 +157,19 @@ mesh_unload(Workers) ->
         end || {N, _M, _P} <- Workers ].
 
 
-%% this method should be improved
 connect_all() -> 
     net_kernel:connect_node(?CENTRAL_NODE),
     OtherNodes = rpc:call(?CENTRAL_NODE, erlang, nodes, []),
     [ net_kernel:connect_node(N) || N <- OtherNodes ],
     ClusterNodes = [?CENTRAL_NODE | OtherNodes],
-    io:format("connect to all nodes (~w) --- ok~n", [ClusterNodes]),
+    io:format("connect to all nodes (~w) ------ ok~n", [ClusterNodes]),
     put(nodes, ClusterNodes).
 
 spawn_init_proc([]) -> 
     io:format("Erlang cluster not available~n", []),
     exit('cluster_not_available');
 spawn_init_proc([H | _]) -> 
-    proc_lib:spawn(H, akita_collector_local, init, []).
+    proc_lib:spawn(H, akita_collector_local, init, [self()]).
 
 add_worker(W) -> 
     case get(workers) of 
@@ -193,4 +192,11 @@ do_collect() ->
 home() -> 
     {ok, [[HOME]]} = init:get_argument(home),
     HOME.
+
+load_module(M) -> 
+    {M, Bin, Fname} = code:get_object_code(M),
+    [ begin
+          io:format("loading module ~w on node ~w~n", [M, N]),
+          rpc:call(N, code, load_binary, [M, Fname, Bin])
+      end || N <- nodes(connected) ].
 

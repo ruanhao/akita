@@ -4,12 +4,12 @@
 -define(AKITA_FILE, filename:join(home(), "akita.record." ++ atom_to_list(node()))).
 -define(TOP_N, 30).
 -include_lib("stdlib/include/ms_transform.hrl").
--export([init/0, start_collect_local/0, read_all/0]).
+-export([init/1, start_collect_local/0, read_all/0]).
 
 %% ====================================================================
 %% API functions
 %% ====================================================================
-init() -> 
+init(Hub) -> 
     io:format("do initialization on ~w~n", [node()]),
     Existed = filelib:is_file(?AKITA_FILE),
     if 
@@ -18,13 +18,12 @@ init() ->
         true    ->
             ok
     end,
-    io:format("creating dets file ~p~n", [?AKITA_FILE]),
     case catch dets:open_file(?MODULE, [{file, ?AKITA_FILE}]) of 
         {ok, ?MODULE} -> 
             dets:close(?MODULE),
-            send_to_hub({init_dets, {node(), ok}});
+            Hub ! {init_dets, {node(), ok}};
         _             -> 
-            send_to_hub({init_dets, {node(), fail}})
+            Hub ! {init_dets, {node(), fail}}
     end.
 
 
@@ -32,18 +31,9 @@ init() ->
 %% ====================================================================
 %% Internal functions
 %% ====================================================================
-send_to_hub(Msg) -> 
-   case global:whereis_name(?HUB) of 
-       undefined -> exit("Hub not available");
-       _         -> ok
-   end,
-   global:send(?HUB, Msg).
-
-    
 home() -> 
     {ok, [[HOME]]} = init:get_argument(home),
     HOME.
-    
 
 akita_insert(V) when is_tuple(V) -> 
     dets:insert(?MODULE, V);
