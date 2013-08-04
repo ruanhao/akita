@@ -93,7 +93,7 @@ handle_info({'DOWN', _Ref, process, Pid, _Info}, State) ->
     [{Node, _M, Pid}] = [{N, M, P} || {N, M, P} <- get(workers), P =:= Pid ],
     delete_worker(Pid),
     NewPid = proc_lib:spawn(Node, akita_collector_local, start_collect_local, []),
-    MonitorRef = erlang:monitor(process, Pid),
+    MonitorRef = erlang:monitor(process, NewPid),
     add_worker({Node, MonitorRef, NewPid}),
     {noreply, State};
 
@@ -197,6 +197,7 @@ load_module(M) ->
     {M, Bin, Fname} = code:get_object_code(M),
     [ begin
           io:format("loading module ~w on node ~w~n", [M, N]),
+          rpc:call(N, code, purge, [M]),
           rpc:call(N, code, load_binary, [M, Fname, Bin])
       end || N <- nodes(connected) ].
 
