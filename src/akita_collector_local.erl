@@ -9,24 +9,25 @@
 %% ====================================================================
 %% API functions
 %% ====================================================================
-init(Hub) -> 
-    io:format("do initialization on ~w~n", [node()]),
-    Existed = filelib:is_file(?AKITA_FILE),
+init(From) ->
+    error_logger:info_msg("do local init on node (~w)~n", [node()]),
+    IsFile = filelib:is_file(?AKITA_FILE),
     if 
-        Existed -> 
-            file:delete(?AKITA_FILE);
-        true    ->
+        IsFile -> 
+            file:delete(?AKITA_FILE);           % check if there is such dets file,
+                                                % if exists, just delete it.
+        true ->
             ok
     end,
-    case catch dets:open_file(?MODULE, [{file, ?AKITA_FILE}]) of 
+    case dets:open_file(?MODULE, [{file, ?AKITA_FILE}]) of 
         {ok, ?MODULE} -> 
-            dets:close(?MODULE),
-            Hub ! {init_dets, {node(), ok}};
+            dets:close(?MODULE),                % just create a new dets file here,
+                                                % so we can append data into it, 
+                                                % but we close it for now.
+            From ! {local_init_res, {node(), ok}};
         _             -> 
-            Hub ! {init_dets, {node(), fail}}
+            From ! {local_init_res, {node(), fail}}
     end.
-
-
 
 %% ====================================================================
 %% Internal functions

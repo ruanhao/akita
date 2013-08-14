@@ -21,12 +21,13 @@
 %%%----------------------------------------------------------------------
 
 -module(akita_cluster_info).
+
 -behaviour(gen_server).
 
--record(state, {nodes}).
+-record(state, {collectors}).                   % 'collectors' is the worker processes
+                                                % on all local nodes.
 
--define(CENTRAL_NODE, 'hello@hao').
--define(TIMEOUT, 150000).
+-define(MAX_TRY_TIMES, 3).                      % max times to check cluster state
 
 %% API Function
 -export([start_link/0]).
@@ -44,14 +45,11 @@ start_link() ->
 %% Behaviour Callbacks
 %% ------------------------------------------------------------------
 init([]) ->
-    io:format("initialization begins~n", []),
-    %% if canine framework is used, there is no need to 'connect_all'
-    connect_all(),
+    error_logger:info_msg("initialize akita~n", []),
     %% in order to call terminate when application stops
     process_flag(trap_exit, true),
-    load_module(akita_collector_local),
-    timer:send_after(1000, do_init),
-    {ok, #state{nodes = get(nodes)}, ?TIMEOUT}.
+    lazy_do(check_meshed),
+    {ok, #state{}}.
 
 handle_call(_Request, _From, State) ->
     {noreply, ok, State}.
@@ -59,43 +57,39 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info(timeout, #state{nodes = [H | _]}) -> 
-    io:format("no response from node: ~w~n", [H]),
-    {stop, no_response, #state{}};
-
-handle_info(do_init, #state{nodes = Nodes} = State) -> 
-    case application:get_env(akita, cluster_info_start) of 
-        {ok, false} -> 
-            io:format("start to init on local nodes~n", []),
-            spawn_init_proc(Nodes), 
-            {noreply, State, ?TIMEOUT}; 
-        {ok, true}  -> 
-            {noreply, State}
-    end;
-
-handle_info({init_dets, {Node, Status}}, #state{nodes = [_ | L]}) -> 
-    io:format("initializaiton on node ~w ------ ~w ~n", [Node, Status]),
-    case Status of 
-        fail -> 
-            {stop, init_fail, #state{}};
-        ok -> 
-            if 
-                L =:= [] -> 
-                    application:set_env(akita, cluster_info_start, true),
-                    {noreply, #state{}};
-                true     -> 
-                    spawn_init_proc(L),
-                    {noreply, #state{nodes = L}, ?TIMEOUT}
-            end
-    end;
-
-handle_info({'DOWN', _Ref, process, Pid, _Info}, State) -> 
-    [{Node, _M, Pid}] = [{N, M, P} || {N, M, P} <- get(workers), P =:= Pid ],
-    delete_worker(Pid),
-    NewPid = proc_lib:spawn(Node, akita_collector_local, start_collect_local, []),
-    MonitorRef = erlang:monitor(process, NewPid),
-    add_worker({Node, MonitorRef, NewPid}),
+handle_info(check_meshed, State) ->
+    check_cluster_meshed(?MAX_TRY_TIMES),
+    lazy_do(load_mod),
     {noreply, State};
+
+handle_info(load_mod, State) ->
+    load_module(akita_collector_local),
+    lazy_do(local_init),
+    {noreply, State};
+
+handle_info(local_init, State) -> 
+    error_logger:info_msg("start to init on local nodes~n", []),
+    spawn_init_proc(nodes(connected)), 
+    {noreply, State}; 
+
+handle_info({'DOWN', Ref, process, _Pid, _Info}, #state{collectors = Collectors} = State) ->
+    [OldCollector] = [{N, R, P} || {N, R, P} <- Collectors, R =:= Ref ],
+    {DownNode, _OldRef, _OldPid} = OldCollector,
+    error_logger:error_msg("collector on node (~w) goes on strike~n", [DownNode]),
+    NewCollectors0 = Collectors -- [OldCollector],
+    NewPid = proc_lib:spawn(DownNode, akita_collector_local, start_collect_local, []),
+    NewCollectors = case is_process_alive(NewPid) of
+                        true ->
+                            error_logger:info_msg("collector on node (~w) goes back to work~n", [DownNode]),
+                            MonitorRef = erlang:monitor(process, NewPid),
+                            NewCollectors0 ++ [{DownNode, MonitorRef, NewPid}];
+                        %% if NewPid is not alive, it is to say that DownNode may be unavailable.
+                        %% so there is no need to restart the collector on that node.
+                        false ->
+                            error_logger:error_msg("collector on node (~w) goes home~n", [DownNode]),
+                            NewCollectors0
+                    end,
+    {noreply, State#state{collectors = NewCollectors}};
 
 handle_info(dump_cluster_info, State) -> 
     Filename = filename:join(home(), "akita.dump"),
@@ -108,7 +102,7 @@ handle_info(dump_cluster_info, State) ->
         io:format(Fd, "~p~n", [Res]),
         io:format(Fd, "=========== akita cluster info on ~w dumps over ===============~n",[N]),
         io:format(Fd, "~n~n~n", [])
-        end || {N, _M, _P} <- Workers ],
+        end || {N, _M, _P} <- Workers],
     file:close(Fd),
     io:format("dump ok~n", []),
     {noreply, State};
@@ -118,8 +112,8 @@ handle_info(stop_collect, State) ->
     {noreply, State};
 
 handle_info(start_collect, State) -> 
-    do_collect(),
-    {noreply, State};
+    Collectors = get_collectors(),
+    {noreply, State#state{collectors = Collectors}};
 
 handle_info(Info, State) ->
     io:format("receive unexpected info: ~w~n", [Info]),
@@ -156,48 +150,59 @@ mesh_unload(Workers) ->
         rpc:call(N, code, delete, [akita_collector_local])
         end || {N, _M, _P} <- Workers ].
 
-
-connect_all() -> 
-    net_kernel:connect_node(?CENTRAL_NODE),
-    OtherNodes = rpc:call(?CENTRAL_NODE, erlang, nodes, []),
-    [ net_kernel:connect_node(N) || N <- OtherNodes ],
-    ClusterNodes = [?CENTRAL_NODE | OtherNodes],
-    io:format("connect to all nodes (~w) ------ ok~n", [ClusterNodes]),
-    put(nodes, ClusterNodes).
-
 spawn_init_proc([]) -> 
-    io:format("Erlang cluster not available~n", []),
-    exit('cluster_not_available');
-spawn_init_proc([H | _]) -> 
-    proc_lib:spawn(H, akita_collector_local, init, [self()]).
+    error_logger:info_msg("local init on all nodes successfully~n", []);
 
-add_worker(W) -> 
-    case get(workers) of 
-        undefined -> put(workers, [W]);
-        Workers   -> put(workers, [W | Workers])
+spawn_init_proc([H | T]) -> 
+    proc_lib:spawn(H, akita_collector_local, init, [self()]),
+    receive
+        {local_init_res, {Node, ok}} ->
+            error_logger:info_msg("local init on node (~w) successfully~n", [Node]),
+            spawn_init_proc(T);
+        {local_init_res, {Node, fail}} ->
+            Msg = io_lib:format("local init on node (~w) unsuccessfully", [Node]),
+            exit(Msg)
+    after
+        2000 ->
+            Msg = io_lib:format("local init on node (~w) unsuccessfully", [H]),
+            exit(Msg)
     end.
 
-delete_worker(Pid) -> 
-    Workers = get(workers),
-    Worker = [ {N, M, P} || {N, M, P} <- Workers, P =:= Pid ], 
-    put(workers, Workers -- Worker).
-
-do_collect() -> 
-    Nodes = get(nodes),
+get_collectors() -> 
+    Nodes = nodes(connected),
     [begin
-                Pid = proc_lib:spawn(N, akita_collector_local, start_collect_local, []),
-                MonitorRef = erlang:monitor(process, Pid),
-                add_worker({N, MonitorRef, Pid})
-        end || N <- Nodes].
+         Pid = proc_lib:spawn(N, akita_collector_local, start_collect_local, []),
+         Ref = erlang:monitor(process, Pid),
+         {N, Ref, Pid}
+     end || N <- Nodes].
+
 home() -> 
     {ok, [[HOME]]} = init:get_argument(home),
     HOME.
 
 load_module(M) -> 
     {M, Bin, Fname} = code:get_object_code(M),
-    [ begin
-          io:format("loading module ~w on node ~w~n", [M, N]),
-          rpc:call(N, code, purge, [M]),
-          rpc:call(N, code, load_binary, [M, Fname, Bin])
-      end || N <- nodes(connected) ].
+    [begin
+         io:format("loading module ~w on node ~w~n", [M, N]),
+         rpc:call(N, code, purge, [M]),
+         rpc:call(N, code, load_binary, [M, Fname, Bin])
+     end || N <- nodes(connected)].
 
+check_cluster_meshed(0) ->
+    Msg = io_lib:format("cluster can not be meshed~n", []),
+    exit(Msg);
+
+check_cluster_meshed(Times) ->
+    State = application:get_env(westminster, cluster_meshed),
+    case State of
+        {ok, true} ->
+            ok;
+        _ ->                                    % {ok, false} or
+                                                % 'undefined'
+            error_logger:info_msg("waiting for cluster meshing~n", []),
+            timer:sleep(5000),
+            check_cluster_meshed(Times - 1)
+    end.
+
+lazy_do(Something) ->
+    timer:send_after(1000, Something).
