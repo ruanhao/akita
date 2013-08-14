@@ -1,15 +1,67 @@
+%%%-------------------------------------------------------------------
+%%% @author ruan <ruanhao1116@gmail.com>
+%%% @copyright (C) 2013, Ericsson
+%%% @doc
+%%% An OTP gen_server used hosted on all nodes to
+%%% collect information locally.
+%%% @end
+%%% Created : 14 Aug 2013 by ruan <ruanhao1116@gmail.com>
+%%%-------------------------------------------------------------------
 -module(akita_collector_local).
--define(HUB, akita_cluster_info).
+
+-behaviour(gen_server).
+
+%% API
+-export([start_link/1, start_collect/0, stop_collect/0]).
+
+%% gen_server callbacks
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2,
+         terminate/2, code_change/3]).
+
+-define(SERVER, ?MODULE).
 -define(INTERVAL, 60).
 -define(AKITA_FILE, filename:join(home(), "akita.record." ++ atom_to_list(node()))).
 -define(TOP_N, 30).
 -include_lib("stdlib/include/ms_transform.hrl").
--export([init/1, start_collect_local/0, read_all/0]).
 
-%% ====================================================================
-%% API functions
-%% ====================================================================
-init(From) ->
+-record(state, {}).
+
+%%%===================================================================
+%%% API
+%%%===================================================================
+
+%%--------------------------------------------------------------------
+%% @doc
+%% Starts the server
+%%
+%% @spec start_link() -> {ok, Pid} | ignore | {error, Error}
+%% @end
+%%--------------------------------------------------------------------
+start_link(From) ->
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [From], []).
+
+
+%%%===================================================================
+%%% gen_server callbacks
+%%%===================================================================
+start_collect() ->
+    gen_server:call(?SERVER, start_collect).
+
+stop_collect() ->
+    gen_server:call(?SERVER, stop_collect).
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% Initializes the server
+%%
+%% @spec init(Args) -> {ok, State} |
+%%                     {ok, State, Timeout} |
+%%                     ignore |
+%%                     {stop, Reason}
+%% @end
+%%--------------------------------------------------------------------
+init([From]) ->
     error_logger:info_msg("do local init on node (~w)~n", [node()]),
     IsFile = filelib:is_file(?AKITA_FILE),
     if 
@@ -27,7 +79,108 @@ init(From) ->
             From ! {local_init_res, {node(), ok}};
         _             -> 
             From ! {local_init_res, {node(), fail}}
-    end.
+    end,
+    {ok, #state{}}.
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% Handling call messages
+%%
+%% @spec handle_call(Request, From, State) ->
+%%                                   {reply, Reply, State} |
+%%                                   {reply, Reply, State, Timeout} |
+%%                                   {noreply, State} |
+%%                                   {noreply, State, Timeout} |
+%%                                   {stop, Reason, Reply, State} |
+%%                                   {stop, Reason, State}
+%% @end
+%%--------------------------------------------------------------------
+handle_call(start_collect, From, State) ->
+    dets:open_file(?MODULE, [{file, ?AKITA_FILE}]),
+    error_logger:info_msg("start to collect info on node (~w)~n", [node()]),
+    lazy_do(start_collect),
+    From ! {collect_started, node()},
+    {reply, ok, State};
+
+handle_call(stop_collect, From, State) ->
+    error_logger:info_msg("stop collecting info on node (~w)~n", [node()]),
+    dump_mailbox(),
+    lazy_do(stop_collect),
+    From ! {collect_stopped, node()},
+    {reply, ok, State};
+    
+handle_call(_Request, _From, State) ->
+    Reply = ok,
+    {reply, Reply, State}.
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% Handling cast messages
+%%
+%% @spec handle_cast(Msg, State) -> {noreply, State} |
+%%                                  {noreply, State, Timeout} |
+%%                                  {stop, Reason, State}
+%% @end
+%%--------------------------------------------------------------------
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% Handling all non call/cast messages
+%%
+%% @spec handle_info(Info, State) -> {noreply, State} |
+%%                                   {noreply, State, Timeout} |
+%%                                   {stop, Reason, State}
+%% @end
+%%--------------------------------------------------------------------
+handle_info(start_collect, State) ->
+    akita_insert(generate_entry()),
+    lazy_do(?INTERVAL, start_collect),
+    {noreply, State};
+
+handle_info(stop_collect, State) ->
+    {stop, "stop collecting", State};
+
+handle_info(_Info, State) ->
+    {noreply, State}.
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% This function is called by a gen_server when it is about to
+%% terminate. It should be the opposite of Module:init/1 and do any
+%% necessary cleaning up. When it returns, the gen_server terminates
+%% with Reason. The return value is ignored.
+%%
+%% @spec terminate(Reason, State) -> void()
+%% @end
+%%--------------------------------------------------------------------
+terminate(_Reason, _State) ->
+    dets:close(?MODULE),                        % in order to save file
+    ok.
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% Convert process state when code is changed
+%%
+%% @spec code_change(OldVsn, State, Extra) -> {ok, NewState}
+%% @end
+%%--------------------------------------------------------------------
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+%%%===================================================================
+%%% Internal functions
+%%%===================================================================
+
+
+
+
 
 %% ====================================================================
 %% Internal functions
@@ -39,26 +192,7 @@ home() ->
 akita_insert(V) when is_tuple(V) -> 
     dets:insert(?MODULE, V);
 akita_insert(_)                  -> 
-    io:format("only tuple can be inserted~n", []).
-
-start_collect_local() -> 
-    process_flag(trap_exit, true),
-    dets:open_file(?MODULE, [{file, ?AKITA_FILE}]),
-    io:format("start to  collect on ~w~n", [node()]),
-    period_collect().
-
-period_collect() -> 
-    akita_insert(generate_entry()),
-    receive
-        stop -> 
-            io:format("local collector on ~w stopped~n", [node()]),
-            dets:close(?MODULE);
-        _    -> %% exit signal when stop akita
-            io:format("local collector on ~w stopped~n", [node()]),
-            dets:close(?MODULE)
-    after
-        ?INTERVAL -> period_collect()
-    end.
+    error_logger:error_msg("only tuple can be inserted~n", []).
 
 epoch() -> 
     calendar:datetime_to_gregorian_seconds(calendar:universal_time())-719528*24*3600.
@@ -119,3 +253,17 @@ read_all() ->
     Res = dets:select(?MODULE, ets:fun2ms(fun(T) -> T end)),
     dets:close(?MODULE),
     Res.
+
+lazy_do(Something) ->
+    timer:send_after(1000, Something).
+
+lazy_do(Latency, Something) ->
+    timer:send_after(Latency, Something).
+
+dump_mailbox() ->
+    receive
+        _Any -> ok
+    after
+        ?INTERVAL -> ok
+    end.
+            

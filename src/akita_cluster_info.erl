@@ -73,7 +73,7 @@ handle_info(local_init, State) ->
     {noreply, State}; 
 
 handle_info({'DOWN', Ref, process, _Pid, _Info}, #state{collectors = Collectors} = State) ->
-    [OldCollector] = [{N, R, P} || {N, R, P} <- Collectors, R =:= Ref ],
+    [OldCollector] = [{N, R, P} || {N, R, P} <- Collectors, R =:= Ref],
     {DownNode, _OldRef, _OldPid} = OldCollector,
     error_logger:error_msg("collector on node (~w) goes on strike~n", [DownNode]),
     NewCollectors0 = Collectors -- [OldCollector],
@@ -90,6 +90,14 @@ handle_info({'DOWN', Ref, process, _Pid, _Info}, #state{collectors = Collectors}
                             NewCollectors0
                     end,
     {noreply, State#state{collectors = NewCollectors}};
+
+handle_info({collect_started, Node}, State) ->
+    error_logger:info_msg("collector on node (~w) is working~n", [Node]),
+    {noreply, State};
+
+handle_info({collect_stopped, Node}, State) ->
+    error_logger:info_msg("collector on node (~w) stops working~n", [Node]),
+    {noreply, State};
 
 handle_info(dump_cluster_info, State) -> 
     Filename = filename:join(home(), "akita.dump"),
@@ -154,7 +162,7 @@ spawn_init_proc([]) ->
     error_logger:info_msg("local init on all nodes successfully~n", []);
 
 spawn_init_proc([H | T]) -> 
-    proc_lib:spawn(H, akita_collector_local, init, [self()]),
+    proc_lib:spawn(H, akita_collector_local, start_link, [self()]),
     receive
         {local_init_res, {Node, ok}} ->
             error_logger:info_msg("local init on node (~w) successfully~n", [Node]),
