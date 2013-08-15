@@ -23,7 +23,9 @@
 -module(akita).            
 
 %% API Functions
--export([start/0, stop/0, start_collect/0, stop_collect/0, dump_cluster_info/0]).
+-export([start/0, stop/0, start_collect/0, stop_collect/0, status/0]).
+
+-define(HUB, akita_cluster_info).
 
 %% ===================================================================
 %% API Functions
@@ -38,13 +40,27 @@ stop() ->
     application:stop(akita).
 
 start_collect() -> 
-    global:send(akita_cluster_info, start_collect).
+    ?HUB ! start_collect.
 
 stop_collect() -> 
-    global:send(akita_cluster_info, stop_collect).
+    ?HUB ! stop_collect.
 
-dump_cluster_info() -> 
-    global:send(akita_cluster_info, dump_cluster_info).
+status() ->
+    Pid = whereis(?HUB),
+    if
+        is_pid(Pid) ->
+            IsProcAlive = is_process_alive(Pid),
+            if
+                not IsProcAlive ->
+                    error_logger:error_msg("akita crashes unexpectedly~n", []);
+                true ->
+                    ?HUB ! status
+            end;
+        true ->
+            error_logger:info_msg("akita does not start yet~n", [])
+    end,
+    ok.
+
 
 
 %% ===================================================================

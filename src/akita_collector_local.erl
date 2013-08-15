@@ -12,19 +12,23 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/2, start_collect/0, stop_collect/0, quit/0]).
+-export([start_link/3, start_collect/0, stop_collect/0, quit/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
 -define(SERVER, ?MODULE).
--define(INTERVAL, 1000).
--define(AKITA_FILE, filename:join(home(), "akita.record." ++ atom_to_list(node()))).
--define(TOP_N, 30).
+-define(LOSE_TEMPER, 2000).                    % in case i have to wait for a long
+                                                % time before an collection period
+                                                % is over. i have no patience.
+-define(DETS_FILE, filename:join(home(), "akita.record." ++ atom_to_list(node()))).
+
 %% -include_lib("stdlib/include/ms_transform.hrl").
 
--record(state, {}).
+%% the config name specified in 'state' record must be the same
+%% as that specified in 'env' entry in app.src file.
+-record(state, {interval, topn}).
 
 %%%===================================================================
 %%% API
@@ -37,20 +41,20 @@
 %% @spec start_link() -> {ok, Pid} | ignore | {error, Error}
 %% @end
 %%--------------------------------------------------------------------
-start_link(From, Flag) ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [From, Flag], []).
+start_link(From, Flag, Paras) ->
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [From, Flag, Paras], []).
 
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
 start_collect() ->
-    gen_server:call(?SERVER, start_collect).
+    gen_server:call(?SERVER, start_collect, ?LOSE_TEMPER).
 
 stop_collect() ->
-    gen_server:call(?SERVER, stop_collect).
+    gen_server:call(?SERVER, stop_collect, ?LOSE_TEMPER).
 
 quit() ->
-    gen_server:call(?SERVER, quit).
+    gen_server:call(?SERVER, quit, ?LOSE_TEMPER).
 
 %%--------------------------------------------------------------------
 %% @private
@@ -63,18 +67,17 @@ quit() ->
 %%                     {stop, Reason}
 %% @end
 %%--------------------------------------------------------------------
-init([From, boot]) ->
+init([From, boot, Paras]) ->
     error_logger:info_msg("start local init on node (~w)~n", [node()]),
-    IsFile = filelib:is_file(?AKITA_FILE),
+    IsFile = filelib:is_file(?DETS_FILE),
     if 
         IsFile -> 
-            file:delete(?AKITA_FILE);           % check if there is such dets file,
+            file:delete(?DETS_FILE);            % check if there is such dets file,
                                                 % if exists, just delete it.
         true ->
             ok
     end,
-    
-    case dets:open_file(?MODULE, [{file, ?AKITA_FILE}]) of 
+    case dets:open_file(?MODULE, [{file, ?DETS_FILE}]) of 
         {ok, ?MODULE} -> 
             dets:close(?MODULE),                % just create a new dets file here,
                                                 % so we can append data into it, 
@@ -83,19 +86,20 @@ init([From, boot]) ->
         _             -> 
             From ! {local_init_res, {node(), fail}}
     end,
-    {ok, #state{}};
+    {ok, init_config(Paras)};
 
-init([From, reboot]) ->
+init([From, reboot, Paras]) ->
     error_logger:info_msg("restart local init on node (~w)~n", [node()]),
-    %% in case of there is no such file.
-    case dets:open_file(?MODULE, [{file, ?AKITA_FILE}]) of 
+    %% in case of there is no such file,
+    %% the possibility is very small.
+    case dets:open_file(?MODULE, [{file, ?DETS_FILE}]) of 
         {ok, ?MODULE} -> 
             dets:close(?MODULE),
             From ! {local_reboot, {node(), ok}};
         _             -> 
             From ! {local_reboot, {node(), fail}}
     end,
-    {ok, #state{}}.
+    {ok, init_config(Paras)}.
 
 
 %%--------------------------------------------------------------------
@@ -113,7 +117,7 @@ init([From, reboot]) ->
 %% @end
 %%--------------------------------------------------------------------
 handle_call(start_collect, {From, _Ref}, State) ->
-    dets:open_file(?MODULE, [{file, ?AKITA_FILE}]),
+    dets:open_file(?MODULE, [{file, ?DETS_FILE}]),
     error_logger:info_msg("start to collect info on node (~w)~n", [node()]),
     lazy_do(start_collect),
     From ! {collect_started, node()},
@@ -161,9 +165,9 @@ handle_cast(_Msg, State) ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-handle_info(start_collect, State) ->
-    akita_insert(generate_entry()),
-    lazy_do(?INTERVAL, start_collect),
+handle_info(start_collect, #state{interval = Intv, topn = TopN} = State) ->
+    akita_insert(generate_entry(TopN)),
+    lazy_do(Intv, start_collect),
     {noreply, State};
 
 handle_info(stop_collect, State) ->
@@ -244,20 +248,20 @@ compare(A, B, Attr, Direction) ->
         up   -> V1 < V2
     end.
 
-top_procs(Procs, Attr) -> 
+top_procs(Procs, Attr, TopN) -> 
     L = lists:sort(fun(A, B) -> compare(A, B, Attr) end, Procs),
-    lists:sublist(L, ?TOP_N).
+    lists:sublist(L, TopN).
 
 dump_all_proc() -> 
     [ {P, process_info(P)} || P <- processes() ].
 
-generate_entry() -> 
+generate_entry(TopN) -> 
     {Core, CpuUtil, MemUtil} = ps_info(),
     Epoch                    = epoch(),
     Procs                    = processes(),
-    ErlangProcsMemTopList    = top_procs(Procs, memory),
-    ErlangProcsRedTopList    = top_procs(Procs, reductions),
-    ErlangProcsMqToplist     = top_procs(Procs, message_queue_len),
+    ErlangProcsMemTopList    = top_procs(Procs, memory, TopN),
+    ErlangProcsRedTopList    = top_procs(Procs, reductions, TopN),
+    ErlangProcsMqToplist     = top_procs(Procs, message_queue_len, TopN),
     AllProcsInfo             = dump_all_proc(),
     {   {epoch, Epoch}, 
         {core, Core}, 
@@ -274,10 +278,18 @@ lazy_do(Something) ->
 lazy_do(Latency, Something) ->
     timer:send_after(Latency, Something).
 
-dump_mailbox() ->
+dump_mailbox() ->             % i figure it may be not necessary :<
     receive
         _Any -> ok
     after
-        ?INTERVAL -> ok
+        0 -> ok
     end.
             
+init_config(Paras) ->
+    Intv = get_config(interval, Paras),
+    TopN = get_config(topn, Paras),
+    #state{interval = Intv, topn = TopN}.
+
+get_config(K, Paras) ->
+    [{K, V}] = [{K0, V0} || {K0, V0} <- Paras, K0 =:= K],
+    V.
