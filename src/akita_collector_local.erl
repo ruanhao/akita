@@ -12,17 +12,17 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/1, start_collect/0, stop_collect/0]).
+-export([start_link/2, start_collect/0, stop_collect/0, quit/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
 -define(SERVER, ?MODULE).
--define(INTERVAL, 60).
+-define(INTERVAL, 1000).
 -define(AKITA_FILE, filename:join(home(), "akita.record." ++ atom_to_list(node()))).
 -define(TOP_N, 30).
--include_lib("stdlib/include/ms_transform.hrl").
+%% -include_lib("stdlib/include/ms_transform.hrl").
 
 -record(state, {}).
 
@@ -37,9 +37,8 @@
 %% @spec start_link() -> {ok, Pid} | ignore | {error, Error}
 %% @end
 %%--------------------------------------------------------------------
-start_link(From) ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [From], []).
-
+start_link(From, Flag) ->
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [From, Flag], []).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -49,6 +48,9 @@ start_collect() ->
 
 stop_collect() ->
     gen_server:call(?SERVER, stop_collect).
+
+quit() ->
+    gen_server:call(?SERVER, quit).
 
 %%--------------------------------------------------------------------
 %% @private
@@ -61,8 +63,8 @@ stop_collect() ->
 %%                     {stop, Reason}
 %% @end
 %%--------------------------------------------------------------------
-init([From]) ->
-    error_logger:info_msg("do local init on node (~w)~n", [node()]),
+init([From, boot]) ->
+    error_logger:info_msg("start local init on node (~w)~n", [node()]),
     IsFile = filelib:is_file(?AKITA_FILE),
     if 
         IsFile -> 
@@ -71,6 +73,7 @@ init([From]) ->
         true ->
             ok
     end,
+    
     case dets:open_file(?MODULE, [{file, ?AKITA_FILE}]) of 
         {ok, ?MODULE} -> 
             dets:close(?MODULE),                % just create a new dets file here,
@@ -80,7 +83,20 @@ init([From]) ->
         _             -> 
             From ! {local_init_res, {node(), fail}}
     end,
+    {ok, #state{}};
+
+init([From, reboot]) ->
+    error_logger:info_msg("restart local init on node (~w)~n", [node()]),
+    %% in case of there is no such file.
+    case dets:open_file(?MODULE, [{file, ?AKITA_FILE}]) of 
+        {ok, ?MODULE} -> 
+            dets:close(?MODULE),
+            From ! {local_reboot, {node(), ok}};
+        _             -> 
+            From ! {local_reboot, {node(), fail}}
+    end,
     {ok, #state{}}.
+
 
 %%--------------------------------------------------------------------
 %% @private
@@ -96,20 +112,28 @@ init([From]) ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-handle_call(start_collect, From, State) ->
+handle_call(start_collect, {From, _Ref}, State) ->
     dets:open_file(?MODULE, [{file, ?AKITA_FILE}]),
     error_logger:info_msg("start to collect info on node (~w)~n", [node()]),
     lazy_do(start_collect),
     From ! {collect_started, node()},
     {reply, ok, State};
 
-handle_call(stop_collect, From, State) ->
+handle_call(stop_collect, {From, _Ref}, State) ->
+    dets:close(?MODULE),
     error_logger:info_msg("stop collecting info on node (~w)~n", [node()]),
     dump_mailbox(),
-    lazy_do(stop_collect),
+    lazy_do(0, stop_collect),
     From ! {collect_stopped, node()},
     {reply, ok, State};
-    
+
+handle_call(quit, _From, State) ->
+    dets:close(?MODULE),
+    error_logger:info_msg("collector on node (~w) quits~n", [node()]),
+    dump_mailbox(),
+    lazy_do(0, quit),
+    {reply, ok, State};
+
 handle_call(_Request, _From, State) ->
     Reply = ok,
     {reply, Reply, State}.
@@ -143,7 +167,10 @@ handle_info(start_collect, State) ->
     {noreply, State};
 
 handle_info(stop_collect, State) ->
-    {stop, "stop collecting", State};
+    {noreply, State};
+
+handle_info(quit, State) ->
+    {stop, normal, State};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -173,13 +200,6 @@ terminate(_Reason, _State) ->
 %%--------------------------------------------------------------------
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
-
-%%%===================================================================
-%%% Internal functions
-%%%===================================================================
-
-
-
 
 
 %% ====================================================================
@@ -247,12 +267,6 @@ generate_entry() ->
         {red_toplist, ErlangProcsRedTopList},
         {mq_toplist, ErlangProcsMqToplist}, 
         {procs_info, AllProcsInfo}}.
-
-read_all() -> 
-    dets:open_file(?MODULE, [{file, ?AKITA_FILE}]),
-    Res = dets:select(?MODULE, ets:fun2ms(fun(T) -> T end)),
-    dets:close(?MODULE),
-    Res.
 
 lazy_do(Something) ->
     timer:send_after(1000, Something).
