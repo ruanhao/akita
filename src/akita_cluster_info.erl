@@ -91,21 +91,22 @@ handle_info({'DOWN', Ref, process, _Pid, _Info}, #state{collectors = Collectors,
             rpc:call(DownNode, ?LOCAL_SERVER, start_collect, []);
         _ -> ok
     end,
-    NewCollectors = receive
-                        {local_reboot, {DownNode, ok}} ->
-                            error_logger:info_msg("collector on node (~w) goes back to work~n", [DownNode]),
-                            MonitorRef = erlang:monitor(process, NewPid),
-                            NewCollectors0 ++ [{DownNode, MonitorRef}];
-                        {local_reboot, {DownNode, fail}} ->
-                            %% if NewPid is not alive, it is to say that DownNode may be unavailable.
-                            %% so there is no need to restart the collector on that node.
-                            error_logger:error_msg("collector on node (~w) goes home~n", [DownNode]),
-                            NewCollectors0
-                    after
-                        5000 ->
-                            error_logger:error_msg("collector on node (~w) goes home (timeout)~n", [DownNode]),
-                            NewCollectors0
-                    end,
+    NewCollectors 
+        = receive
+              {local_reboot, {DownNode, ok}} ->
+                  error_logger:info_msg("collector on node (~w) goes back to work~n", [DownNode]),
+                  MonitorRef = erlang:monitor(process, NewPid),
+                  NewCollectors0 ++ [{DownNode, MonitorRef}];
+              {local_reboot, {DownNode, fail}} ->
+                  %% if NewPid is not alive, it is to say that DownNode may be unavailable.
+                  %% so there is no need to restart the collector on that node.
+                  error_logger:error_msg("collector on node (~w) goes home~n", [DownNode]),
+                  NewCollectors0
+          after
+              5000 ->
+                  error_logger:error_msg("collector on node (~w) goes home (timeout)~n", [DownNode]),
+                  NewCollectors0
+          end,
     {noreply, State#state{collectors = NewCollectors}};
 
 handle_info(start_collect, #state{collectors = []} = State) ->
@@ -207,11 +208,11 @@ start_local_servers([], Collectors) ->
 start_local_servers([H | T], Collectors) ->
     {ok, Pid} = rpc:call(H, ?LOCAL_SERVER, start_link, [self(), boot, init_config()]),
     receive
-        {local_init_res, {Node, ok}} ->
+        {local_init, {Node, ok}} ->
             error_logger:info_msg("local init on node (~w) successfully~n", [Node]),
             Ref = erlang:monitor(process, Pid),
             start_local_servers(T, [{H, Ref} | Collectors]);
-        {local_init_res, {Node, fail}} ->
+        {local_init, {Node, fail}} ->
             Msg = io_lib:format("local init on node (" ++ atom_to_list(Node) ++ ") unsuccessfully", []),
             exit(Msg)
     after
@@ -262,8 +263,9 @@ servers_prepare() ->
 
 init_config() ->
     Interval = get_akita_env(interval, 5 * 60 * 1000),
-    TopN = get_akita_env(topn, 30),    
-    [{interval, Interval}, {topn, TopN}].
+    TopN = get_akita_env(topn, 30),
+    SmpSupport = get_akita_env(smp, true),
+    [{interval, Interval}, {topn, TopN}, {smp, SmpSupport}].
     
 get_akita_env(Key, Default) ->
     V0 = application:get_env(akita, Key),

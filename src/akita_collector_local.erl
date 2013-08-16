@@ -26,7 +26,7 @@
 %% the config name specified in 'state' record must be the same
 %% as that specified in 'env' entry in app.src file.
 -record(state, {interval = 60000, topn = 10, 
-                working = false}).
+                working = false, smp = true}).
 
 %%%===================================================================
 %%% API
@@ -67,36 +67,18 @@ quit() ->
 %%--------------------------------------------------------------------
 init([From, boot, Paras]) ->
     error_logger:info_msg("start local init on node (~w)~n", [node()]),
-    IsFile = filelib:is_file(?DETS_FILE),
-    if 
-        IsFile -> 
-            file:delete(?DETS_FILE);            % check if there is such dets file,
-                                                % if exists, just delete it.
-        true ->
-            ok
-    end,
-    case dets:open_file(?MODULE, [{file, ?DETS_FILE}]) of 
-        {ok, ?MODULE} -> 
-            dets:close(?MODULE),                % just create a new dets file here,
-                                                % so we can append data into it, 
-                                                % but we close it for now.
-            From ! {local_init_res, {node(), ok}};
-        _             -> 
-            From ! {local_init_res, {node(), fail}}
-    end,
+    remove_old_dets(),
+    %% just create a new dets file here,
+    %% so we can append data into it, 
+    %% but we close it for now.
+    create_new_dets(From, local_init),
     {ok, init_config(Paras)};
 
 init([From, reboot, Paras]) ->
     error_logger:info_msg("restart local init on node (~w)~n", [node()]),
     %% in case of there is no such file,
     %% the possibility is very small.
-    case dets:open_file(?MODULE, [{file, ?DETS_FILE}]) of 
-        {ok, ?MODULE} -> 
-            dets:close(?MODULE),
-            From ! {local_reboot, {node(), ok}};
-        _             -> 
-            From ! {local_reboot, {node(), fail}}
-    end,
+    create_new_dets(From, local_reboot),
     {ok, init_config(Paras)}.
 
 
@@ -147,8 +129,8 @@ handle_info(start_collect, State) ->
     lazy_do(0, period_collect),
     {noreply, State#state{working = true}};
 
-handle_info(period_collect, #state{interval = Intv, topn = TopN, working = true} = State) ->
-    akita_insert(generate_entry(TopN)),
+handle_info(period_collect, #state{interval = Intv, working = true} = State) ->
+    akita_insert(generate_entry(State)),
     lazy_do(Intv, period_collect),
     {noreply, State};
 
@@ -208,60 +190,96 @@ akita_insert(V) ->
     dets:insert(?MODULE, V).
 
 epoch() -> 
-    %% calendar:datetime_to_gregorian_seconds(calendar:universal_time())-719528*24*3600.
+%%  calendar:datetime_to_gregorian_seconds(calendar:universal_time())-719528*24*3600.
     calendar:local_time().
 
 beam_pid() -> 
     os:getpid().
 
-ps_info() -> 
-    Affinity = os:cmd("ps -eo cpuid,pid | tail -n 1 | sed -e 's/^[[:space:]]*//' | awk '{print $1}'") -- "\n", %lalalallalal
-    Cmd = "ps -eo pid,psr,pcpu,pmem | egrep '^\\s*" ++ beam_pid() ++ "\\b'",
-    Res = os:cmd(Cmd),
-    [_Pid, CoreStr, CpuUtilStr, MemUtilStr] = string:tokens(Res, "\n\s"),
-    Core    = list_to_integer(CoreStr),
-    CpuUtil = list_to_float(CpuUtilStr),
-    MemUtil = list_to_float(MemUtilStr),
-    {Core, CpuUtil, MemUtil}.
+system(Cmd) ->
+    From = self(),
+    Timeout = 5000,
+    Worker = 
+        spawn(fun() ->
+                      Res  = os:cmd(Cmd),
+                      From ! {ok, Res} 
+              end),
+    receive
+        {ok, Res} ->
+            Res
+    after
+        Timeout ->
+            exit(Worker, kill),
+            fail
+    end.
 
-get_proc_attr(Proc, Attr) when is_pid(Proc) -> 
+get_memutil() ->
+    VmMemory = erlang:memory(total),
+    [SysTotMemory] = [V || {system_total_memory, V} <- memsup:get_system_memory_data()],
+    1.0 * VmMemory / SysTotMemory.
+
+
+sys_info(true, true) ->
+    Core = -1,                                  % because of SMP enabled
+    CpuUtil = cpu_sup:util(),
+    MemUtil = get_memutil(),
+    {Core, CpuUtil, MemUtil};
+
+sys_info(true, false) ->
+    Shell = io_lib:format("ps -eo psr,pid | grep ~w | tail -n 1 | sed -e 's/^[[:space:]]*//' | awk '{print $1}'", [beam_pid()]),
+    Affinity = system(Shell),
+    Core = case Affinity of
+               fail -> -1;
+               Res -> list_to_integer(Res -- "\n")
+           end,
+    [CpuUtil] = [V || {C, V, _, _} <- cpu_sup:util([per_cpu]), C =:= Core],
+    MemUtil = get_memutil(),
+    {Core, CpuUtil, MemUtil};
+
+sys_info(_OsSupport, _SmpSupport) ->
+    {-1, -1, -1}.
+
+get_proc_attr(Proc, Attr) ->
     case catch process_info(Proc, Attr) of 
+        {Attr, V} -> V;
         {'EXIT', _} -> -9999;
-        {Attr  , V} -> V
+        undefined -> -9999
     end.
 
 compare(A, B, Attr) -> 
     compare(A, B, Attr, down).
+
 compare(A, B, Attr, Direction) -> 
-    [V1, V2] = [ get_proc_attr(P, Attr) || P <- [A, B] ],
+    [V1, V2] = [get_proc_attr(P, Attr) || P <- [A, B]],
     case Direction of 
         down -> V1 > V2;
-        up   -> V1 < V2
+        up -> V1 < V2
     end.
 
 top_procs(Procs, Attr, TopN) -> 
     L = lists:sort(fun(A, B) -> compare(A, B, Attr) end, Procs),
     lists:sublist(L, TopN).
 
-dump_all_proc() -> 
-    [ {P, process_info(P)} || P <- processes() ].
+dump_all_proc(Procs) -> 
+    [{P, process_info(P)} || P <- Procs].
 
-generate_entry(TopN) -> 
-    {Core, CpuUtil, MemUtil} = ps_info(),
-    Epoch                    = epoch(),
-    Procs                    = processes(),
-    ErlangProcsMemTopList    = top_procs(Procs, memory, TopN),
-    ErlangProcsRedTopList    = top_procs(Procs, reductions, TopN),
-    ErlangProcsMqToplist     = top_procs(Procs, message_queue_len, TopN),
-    AllProcsInfo             = dump_all_proc(),
-    {   {epoch, Epoch}, 
-        {core, Core}, 
-        {cpu_util, CpuUtil}, 
-        {mem_util, MemUtil}, 
-        {mem_toplist, ErlangProcsMemTopList}, 
-        {red_toplist, ErlangProcsRedTopList},
-        {mq_toplist, ErlangProcsMqToplist}, 
-        {procs_info, AllProcsInfo}}.
+generate_entry(#state{topn = TopN, smp = SmpSupport}) -> 
+    {Core, CpuUtil, MemUtil} = sys_info(check_os(), SmpSupport),
+    Epoch = epoch(),
+    Procs = processes(),
+    ErlangProcsMemTopList = top_procs(Procs, memory, TopN),
+    ErlangProcsRedTopList = top_procs(Procs, reductions, TopN),
+    ErlangProcsMqToplist = top_procs(Procs, message_queue_len, TopN),
+    AllRelatedProcs = lists:usort(ErlangProcsMemTopList ++ ErlangProcsRedTopList ++ ErlangProcsMqToplist),
+    ProcsInfoNeeded = dump_all_proc(AllRelatedProcs),
+    {{epoch, Epoch},
+     {core, Core}, 
+     {cpu_util, CpuUtil}, 
+     {mem_util, MemUtil}, 
+     {mem_toplist, ErlangProcsMemTopList}, 
+     {red_toplist, ErlangProcsRedTopList},
+     {mq_toplist, ErlangProcsMqToplist}, 
+     {procs_info, ProcsInfoNeeded}}.
 
 lazy_do(Latency, Something) ->
     timer:send_after(Latency, Something).
@@ -276,7 +294,8 @@ dump_mailbox() ->             % i figure it may be not necessary :<
 init_config(Paras) ->
     Intv = get_config(interval, Paras),
     TopN = get_config(topn, Paras),
-    #state{interval = Intv, topn = TopN}.
+    Smp = get_config(smp, Paras),
+    #state{interval = Intv, topn = TopN, smp = Smp}.
 
 get_config(K, Paras) ->
     [{K, V}] = [{K0, V0} || {K0, V0} <- Paras, K0 =:= K],
@@ -284,3 +303,29 @@ get_config(K, Paras) ->
 
 info(Msg) ->
     ?SERVER ! Msg.
+
+remove_old_dets() ->
+    IsFile = filelib:is_file(?DETS_FILE),
+    if 
+        IsFile -> 
+            file:delete(?DETS_FILE);            % check if there is such dets file,
+                                                % if exists, just delete it.
+        true ->
+            ok
+    end.
+
+create_new_dets(RespondTo, When) ->
+    case dets:open_file(?MODULE, [{file, ?DETS_FILE}]) of 
+        {ok, ?MODULE} -> 
+            dets:close(?MODULE),                
+            RespondTo ! {When, {node(), ok}};
+        _ -> 
+            RespondTo ! {When, {node(), fail}}
+    end.
+
+check_os() ->
+    case os:type() of
+        {unix, linux} -> true;                           
+        _ -> false
+    end.            
+                
