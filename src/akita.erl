@@ -23,7 +23,13 @@
 -module(akita).            
 
 %% API Functions
--export([start/0, stop/0, start_collect/0, stop_collect/0, status/0]).
+-export([start/0, 
+         stop/0, 
+         start_collect/0, 
+         stop_collect/0, 
+         status/0, 
+         log/0, log/1, 
+         q/1]).
 
 -define(HUB, akita_cluster_info).
 
@@ -37,15 +43,41 @@ start() ->
     application:start(akita).
 
 stop() ->
-    application:stop(akita).
+    command({self(), stop}),
+    receive
+        please_stop_akita ->
+            application:stop(akita)
+    after
+        5000 ->
+            application:stop(akita)
+    end.
 
 start_collect() -> 
-    ?HUB ! start_collect.
+    command(start_collect).
 
 stop_collect() -> 
-    ?HUB ! stop_collect.
+    command(stop_collect).
 
 status() ->
+    command(status).
+
+log() ->
+    log(all).
+
+log(N) ->
+    rb:stop(),
+    rb:start([{max, N}]),
+    rb:list().
+
+q(N) ->
+    rb:show(N).
+
+
+
+%% ===================================================================
+%% Inner Functions
+%% ===================================================================
+command(Cmd) ->
     Pid = whereis(?HUB),
     if
         is_pid(Pid) ->
@@ -54,18 +86,13 @@ status() ->
                 not IsProcAlive ->
                     error_logger:error_msg("akita crashes unexpectedly~n", []);
                 true ->
-                    ?HUB ! status
+                    ?HUB ! Cmd
             end;
         true ->
             error_logger:info_msg("akita does not start yet~n", [])
     end,
     ok.
 
-
-
-%% ===================================================================
-%% Inner Functions
-%% ===================================================================
 ensure_started(App) ->
     case application:start(App) of
         ok ->

@@ -24,10 +24,12 @@
 
 -behaviour(gen_server).
 
--record(state, {collectors = [], collecting = false}).       % 'collectors' is the worker processes
-                                                % on all local nodes.
-                                                % 'collecting' indicates whether they are
-                                                % doing job now.
+% 'collectors' is the worker processes   
+% on all local nodes.                    
+% 'collecting' indicates whether they are
+% doing job now. 
+-record(state, {collectors = [], collecting = false, 
+                start_clct_time = " undefined~n", end_clct_time = " undefined~n"}).      
 
 -define(MAX_TRY_TIMES, 3).                      % max times to check cluster state
 -define(LOCAL_SERVER, akita_collector_local).
@@ -106,12 +108,26 @@ handle_info({'DOWN', Ref, process, _Pid, _Info}, #state{collectors = Collectors,
                     end,
     {noreply, State#state{collectors = NewCollectors}};
 
-handle_info({collect_started, Node}, State) ->
-    error_logger:info_msg("collector on node (~w) is working~n", [Node]),
+handle_info(start_collect, #state{collectors = []} = State) ->
+    error_logger:error_msg("there are no collectors at all~n", []),
     {noreply, State};
 
-handle_info({collect_stopped, Node}, State) ->
-    error_logger:info_msg("collector on node (~w) stops working~n", [Node]),
+handle_info(start_collect, #state{collecting = true} = State) ->
+    error_logger:error_msg("collecting is going~n", []),
+    {noreply, State};
+
+handle_info(start_collect, #state{collectors = Collectors} = State) ->
+    [rpc:call(N, ?LOCAL_SERVER, start_collect, []) || {N, _R} <- Collectors],
+    {noreply, State#state{collecting = true, 
+                          start_clct_time = get_current_time(), 
+                          end_clct_time = " undefined~n"}};
+
+handle_info(stop_collect, #state{collectors = []} = State) ->
+    error_logger:error_msg("there are not collectors at all~n", []),
+    {noreply, State};
+
+handle_info(stop_collect, #state{collecting = false} = State) ->
+    error_logger:error_msg("collecting is already stopped~n", []),
     {noreply, State};
 
 handle_info(stop_collect, #state{collectors = Collectors} = State) ->
@@ -119,40 +135,48 @@ handle_info(stop_collect, #state{collectors = Collectors} = State) ->
          timer:sleep(100),                      % in order to avoid Race Condition
          rpc:call(N, ?LOCAL_SERVER, stop_collect, [])
      end || {N, _R} <- Collectors],
-    {noreply, State#state{collecting = false}};
+    {noreply, State#state{collecting = false, end_clct_time = get_current_time()}};
 
-handle_info(start_collect, #state{collectors = Collectors} = State) ->
-    [rpc:call(N, ?LOCAL_SERVER, start_collect, []) || {N, _R} <- Collectors],
-    {noreply, State#state{collecting = true}};
-
-handle_info(status, #state{collectors = Collectors, collecting = IsWorking} = State) ->
-    SplitLine = "--------------------------------------------------",
-    WorkingNodes = [atom_to_list(N) ++ "\n" || {N, _} <- Collectors],
+handle_info(status, #state{collectors = Collectors, collecting = IsWorking, 
+                           start_clct_time = StartTime, end_clct_time = EndTime} = State) ->
+    SplitLine = "----------------------------~n",
+    WorkingNodes = [io_lib:format("~w~n", [N]) || {N, _} <- Collectors],
     WorkingNodesStr = lists:flatten(WorkingNodes),
-    error_logger:info_msg("CURRENT COLLECTORS: ~n~s" 
-                          ++ SplitLine ++ "~nIS COLLECTING NOW: ~n~w~n", [WorkingNodesStr, IsWorking]),
+    Configs = [io_lib:format("~w: ~w~n", [K, V]) || {K, V} <- init_config()],
+    ConfigsStr = lists:flatten(Configs),
+    IsWorkingStr = io_lib:format("~w~n", [IsWorking]),
+    error_logger:info_msg("CURRENT COLLECTORS: ~n" ++ WorkingNodesStr ++ SplitLine ++ 
+                              "IS COLLECTING NOW: ~n" ++ IsWorkingStr ++ SplitLine ++
+                              "START COLLECTING: ~n" ++ StartTime ++ 
+                              "STOP COLLECTING: ~n" ++ EndTime ++ SplitLine ++ 
+                              "CONFIGS: ~n" ++ ConfigsStr ++ SplitLine, []),
     {noreply, State};
 
-handle_info(Info, State) ->
-    error_logger:error_msg("receive unexpected info: ~w~n", [Info]),
-    {noreply, State}.
-
-terminate(Reason, #state{collectors = undefined}) ->
-    error_logger:error_msg("akita shuts down with reason: ~w~n", [Reason]),
-    mesh_unload0(nodes(connected)),
-    ok;
-
-terminate(Reason, #state{collectors = Collectors}) ->
+handle_info({From, stop}, #state{collectors = Collectors} = State) ->
+    error_logger:info_msg("akita about to stop~n", []),
     [begin
          erlang:demonitor(R),
          timer:sleep(100),
          rpc:call(N, ?LOCAL_SERVER, quit, [])
      end || {N, R} <- Collectors],
-    timer:sleep(500),           % make sure that all collector is down,
-                                % the max waiting time is 5 seconds due
-                                % to OTP limitation.
-    error_logger:info_msg("akita shuts down with reason: ~w~n", [Reason]),
+    timer:sleep(3000),          % make sure that all collector is down 
+                                % before mesh_unload. the max waiting time
+                                % is 5 seconds due to OTP supervisor child spec.
     mesh_unload1(Collectors),
+    From ! please_stop_akita,
+    {noreply, State#state{collectors = useless}};
+
+handle_info(Info, State) ->
+    error_logger:error_msg("receive unexpected info: ~w~n", [Info]),
+    {noreply, State}.
+
+terminate(shutdown, _State) ->
+    error_logger:info_msg("akita stops gracefully ~n", []),
+    ok;
+
+terminate(Reason, _State) ->
+    error_logger:error_msg("akita crashes with reason: ~w~n", [Reason]),
+    mesh_unload0(nodes(connected)),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -247,3 +271,8 @@ get_akita_env(Key, Default) ->
         {ok, V} -> V;
         undefined -> Default
     end.
+
+get_current_time() ->
+    {{Year, Month, Day}, {Hour, Min, Sec}} = calendar:local_time(),
+    io_lib:format("~2B/~2B/~4B ~2B:~2.10.0B:~2.10.0B\n", 
+                  [Month, Day, Year, Hour, Min, Sec]).

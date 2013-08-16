@@ -19,16 +19,14 @@
          terminate/2, code_change/3]).
 
 -define(SERVER, ?MODULE).
--define(LOSE_TEMPER, 2000).                    % in case i have to wait for a long
-                                                % time before an collection period
-                                                % is over. i have no patience.
 -define(DETS_FILE, filename:join(home(), "akita.record." ++ atom_to_list(node()))).
 
 %% -include_lib("stdlib/include/ms_transform.hrl").
 
 %% the config name specified in 'state' record must be the same
 %% as that specified in 'env' entry in app.src file.
--record(state, {interval, topn}).
+-record(state, {interval = 60000, topn = 10, 
+                working = false}).
 
 %%%===================================================================
 %%% API
@@ -48,13 +46,13 @@ start_link(From, Flag, Paras) ->
 %%% gen_server callbacks
 %%%===================================================================
 start_collect() ->
-    gen_server:call(?SERVER, start_collect, ?LOSE_TEMPER).
+    info(start_collect).
 
 stop_collect() ->
-    gen_server:call(?SERVER, stop_collect, ?LOSE_TEMPER).
+    info(stop_collect).
 
 quit() ->
-    gen_server:call(?SERVER, quit, ?LOSE_TEMPER).
+    info(quit).
 
 %%--------------------------------------------------------------------
 %% @private
@@ -116,28 +114,6 @@ init([From, reboot, Paras]) ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-handle_call(start_collect, {From, _Ref}, State) ->
-    dets:open_file(?MODULE, [{file, ?DETS_FILE}]),
-    error_logger:info_msg("start to collect info on node (~w)~n", [node()]),
-    lazy_do(start_collect),
-    From ! {collect_started, node()},
-    {reply, ok, State};
-
-handle_call(stop_collect, {From, _Ref}, State) ->
-    dets:close(?MODULE),
-    error_logger:info_msg("stop collecting info on node (~w)~n", [node()]),
-    dump_mailbox(),
-    lazy_do(0, stop_collect),
-    From ! {collect_stopped, node()},
-    {reply, ok, State};
-
-handle_call(quit, _From, State) ->
-    dets:close(?MODULE),
-    error_logger:info_msg("collector on node (~w) quits~n", [node()]),
-    dump_mailbox(),
-    lazy_do(0, quit),
-    {reply, ok, State};
-
 handle_call(_Request, _From, State) ->
     Reply = ok,
     {reply, Reply, State}.
@@ -165,16 +141,31 @@ handle_cast(_Msg, State) ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-handle_info(start_collect, #state{interval = Intv, topn = TopN} = State) ->
+handle_info(start_collect, State) ->
+    dets:open_file(?MODULE, [{file, ?DETS_FILE}]),
+    error_logger:info_msg("start to collect info on node (~w)~n", [node()]),
+    lazy_do(0, period_collect),
+    {noreply, State#state{working = true}};
+
+handle_info(period_collect, #state{interval = Intv, topn = TopN, working = true} = State) ->
     akita_insert(generate_entry(TopN)),
-    lazy_do(Intv, start_collect),
+    lazy_do(Intv, period_collect),
+    {noreply, State};
+
+handle_info(period_collect, #state{working = false} = State) -> 
     {noreply, State};
 
 handle_info(stop_collect, State) ->
-    {noreply, State};
+    dets:close(?MODULE),
+    error_logger:info_msg("stop collecting info on node (~w)~n", [node()]),
+    dump_mailbox(),
+    {noreply, State#state{working = false}};
 
 handle_info(quit, State) ->
-    {stop, normal, State};
+    dets:close(?MODULE),
+    error_logger:info_msg("collector on node (~w) quits~n", [node()]),
+    dump_mailbox(),
+    {stop, normal, State#state{working = false}}; % set 'working' to 'false' just because of 'Obsessive Compulsive Disorder'
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -213,18 +204,18 @@ home() ->
     {ok, [[HOME]]} = init:get_argument(home),
     HOME.
 
-akita_insert(V) when is_tuple(V) -> 
-    dets:insert(?MODULE, V);
-akita_insert(_)                  -> 
-    error_logger:error_msg("only tuple can be inserted~n", []).
+akita_insert(V) -> 
+    dets:insert(?MODULE, V).
 
 epoch() -> 
-    calendar:datetime_to_gregorian_seconds(calendar:universal_time())-719528*24*3600.
+    %% calendar:datetime_to_gregorian_seconds(calendar:universal_time())-719528*24*3600.
+    calendar:local_time().
 
 beam_pid() -> 
     os:getpid().
 
 ps_info() -> 
+    Affinity = os:cmd("ps -eo cpuid,pid | tail -n 1 | sed -e 's/^[[:space:]]*//' | awk '{print $1}'") -- "\n", %lalalallalal
     Cmd = "ps -eo pid,psr,pcpu,pmem | egrep '^\\s*" ++ beam_pid() ++ "\\b'",
     Res = os:cmd(Cmd),
     [_Pid, CoreStr, CpuUtilStr, MemUtilStr] = string:tokens(Res, "\n\s"),
@@ -272,9 +263,6 @@ generate_entry(TopN) ->
         {mq_toplist, ErlangProcsMqToplist}, 
         {procs_info, AllProcsInfo}}.
 
-lazy_do(Something) ->
-    timer:send_after(1000, Something).
-
 lazy_do(Latency, Something) ->
     timer:send_after(Latency, Something).
 
@@ -293,3 +281,6 @@ init_config(Paras) ->
 get_config(K, Paras) ->
     [{K, V}] = [{K0, V0} || {K0, V0} <- Paras, K0 =:= K],
     V.
+
+info(Msg) ->
+    ?SERVER ! Msg.
