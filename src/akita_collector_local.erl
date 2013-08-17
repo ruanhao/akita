@@ -12,7 +12,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/3, start_collect/0, stop_collect/0, quit/0]).
+-export([start_link/3, start_collect/0, stop_collect/0, quit/0, pull/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -50,6 +50,9 @@ start_collect() ->
 
 stop_collect() ->
     info(stop_collect).
+
+pull(From) ->
+    info({pull, From}).
 
 quit() ->
     info(quit).
@@ -125,6 +128,7 @@ handle_cast(_Msg, State) ->
 %%--------------------------------------------------------------------
 handle_info(start_collect, State) ->
     dets:open_file(?MODULE, [{file, ?DETS_FILE}]),
+    start_sup(),
     error_logger:info_msg("start to collect info on node (~w)~n", [node()]),
     lazy_do(0, period_collect),
     {noreply, State#state{working = true}};
@@ -139,9 +143,25 @@ handle_info(period_collect, #state{working = false} = State) ->
 
 handle_info(stop_collect, State) ->
     dets:close(?MODULE),
+    stop_sup(),
     error_logger:info_msg("stop collecting info on node (~w)~n", [node()]),
     dump_mailbox(),
     {noreply, State#state{working = false}};
+
+handle_info({pull, From}, #state{working = false} = State) ->
+    Basename = filename:basename(?DETS_FILE),
+    From ! {pull_ack, self(), Basename},
+    {noreply, State};
+
+handle_info({trans_req, {Hostname, Port}}, State) ->
+    case gen_tcp:connect(Hostname, Port, [binary, {packet, raw}]) of
+        {ok, Sock} ->
+            file:sendfile(?DETS_FILE, Sock),
+            gen_tcp:close(Sock);
+        {error, Reason} ->
+            error_logger:error_msg("collector can not send file ~p (~w) ~n", [?DETS_FILE, Reason])
+    end,
+    {noreply, State};
 
 handle_info(quit, State) ->
     dets:close(?MODULE),
@@ -165,6 +185,7 @@ handle_info(_Info, State) ->
 %%--------------------------------------------------------------------
 terminate(_Reason, _State) ->
     dets:close(?MODULE),                        % in order to save file
+    stop_sup(),
     ok.
 
 %%--------------------------------------------------------------------
@@ -217,7 +238,6 @@ get_memutil() ->
     VmMemory = erlang:memory(total),
     [SysTotMemory] = [V || {system_total_memory, V} <- memsup:get_system_memory_data()],
     1.0 * VmMemory / SysTotMemory.
-
 
 sys_info(true, true) ->
     Core = -1,                                  % because of SMP enabled
@@ -329,3 +349,10 @@ check_os() ->
         _ -> false
     end.            
                 
+start_sup() ->
+    cpu_sup:start(),
+    memsup:start_link().
+
+stop_sup() ->
+    cpu_sup:stop(),
+    exit(whereis(memsup), normal).

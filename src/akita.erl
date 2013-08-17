@@ -26,7 +26,8 @@
 -export([start/0, 
          stop/0, 
          start_collect/0, 
-         stop_collect/0, 
+         stop_collect/0,
+         pull/0,
          status/0, 
          log/0, log/1, 
          q/1]).
@@ -57,6 +58,9 @@ start_collect() ->
 
 stop_collect() -> 
     command(stop_collect).
+
+pull() ->
+    command(pull).
 
 status() ->
     command(status).

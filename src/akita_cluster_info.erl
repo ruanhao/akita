@@ -28,8 +28,9 @@
 % on all local nodes.                    
 % 'collecting' indicates whether they are
 % doing job now. 
--record(state, {collectors = [], collecting = false, 
-                start_clct_time = " undefined~n", end_clct_time = " undefined~n"}).      
+-record(state, {collectors = [], collecting = false,
+                start_clct_time = " undefined~n", end_clct_time = " undefined~n", 
+                repo, transfered = 0}).      
 
 -define(MAX_TRY_TIMES, 3).                      % max times to check cluster state
 -define(LOCAL_SERVER, akita_collector_local).
@@ -167,8 +168,49 @@ handle_info({From, stop}, #state{collectors = Collectors} = State) ->
     From ! please_stop_akita,
     {noreply, State#state{collectors = useless}};
 
+handle_info(pull, #state{collecting = true} = State) ->
+    error_logger:error_msg("collector is working now, don't be so hurry~n", []),
+    {noreply, State};
+
+handle_info(pull, #state{collecting = false, collectors = Collectors} = State) ->
+    {ok, [[Home]]} = init:get_argument(home),
+    {{Y, M, D}, {H, Min, S}} = calendar:local_time(),
+    DirName = io_lib:format("doghair_~w_~w_~w_~w_~w_~w", [Y, M, D, H, Min, S]),
+    Repo = filename:join(Home, DirName),
+    file:make_dir(Repo),
+    [rpc:call(N, ?LOCAL_SERVER, pull, [self()]) || {N, _} <- Collectors],
+    {noreply, State#state{repo = Repo, transfered = 0}};
+
+handle_info({pull_ack, From, FileName}, #state{repo = Repo} = State) ->
+    {ok, Listen} = gen_tcp:listen(0, [binary, {packet, raw}, {active, false}]),
+    {ok, Hostname} = inet:gethostname(),
+    {ok, Port} = inet:port(Listen),
+    Hub = self(),
+    SaveFile = filename:join(Repo, FileName),
+    proc_lib:spawn(fun() ->
+                           case gen_tcp:accept(Listen, 5000) of
+                               {ok, Sock} ->
+                                   {ok, IoDevice} = file:open(SaveFile, [write, binary]),
+                                   recv_sock(Sock, IoDevice, Hub, FileName);
+                                {error, Reason} ->
+                                   error_logger:error_msg("~p can not be retrieved (~w) ~n", [FileName, Reason])
+                           end
+                   end),
+    timer:sleep(500),
+    From ! {trans_req, {Hostname, Port}},
+    {noreply, State};
+
+handle_info(retrieved, #state{transfered = Done, collectors = Collectors} = State) ->
+    if
+        (Done + 1) =:= length(Collectors) ->
+            error_logger:info_msg("data on all nodes transfered~n", []);
+        true ->
+            ok
+    end,
+    {noreply, State#state{transfered = Done + 1}};
+
 handle_info(Info, State) ->
-    error_logger:error_msg("receive unexpected info: ~w~n", [Info]),
+    error_logger:error_msg("receive unexpected info: ~p~n", [Info]),
     {noreply, State}.
 
 terminate(shutdown, _State) ->
@@ -278,3 +320,19 @@ get_current_time() ->
     {{Year, Month, Day}, {Hour, Min, Sec}} = calendar:local_time(),
     io_lib:format("~2B/~2B/~4B ~2B:~2.10.0B:~2.10.0B\n", 
                   [Month, Day, Year, Hour, Min, Sec]).
+
+recv_sock(Sock, IoDevice, Hub, FileName) ->
+    case gen_tcp:recv(Sock, 0, 5000) of
+        {ok, B} ->
+            file:write(IoDevice, B),
+            recv_sock(Sock, IoDevice, Hub, FileName);
+        {error, closed} ->
+            file:close(IoDevice),
+            gen_tcp:close(Sock),
+            Hub ! retrieved,
+            error_logger:info_msg("~p retrieved ~n", [FileName]);
+        {error, Reason} ->
+            file:close(IoDevice),
+            gen_tcp:close(Sock),
+            error_logger:error_msg("~p can not be retrieved (~p) ~n", [FileName, Reason])
+    end.
