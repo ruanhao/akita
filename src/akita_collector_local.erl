@@ -153,7 +153,7 @@ handle_info({pull, From}, #state{working = false} = State) ->
     From ! {pull_ack, self(), Basename},
     {noreply, State};
 
-handle_info({trans_req, {Hostname, Port}}, State) ->
+handle_info({pull_req, {Hostname, Port}}, State) ->
     case gen_tcp:connect(Hostname, Port, [binary, {packet, raw}]) of
         {ok, Sock} ->
             file:sendfile(?DETS_FILE, Sock),

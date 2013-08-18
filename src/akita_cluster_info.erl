@@ -30,7 +30,7 @@
 % doing job now. 
 -record(state, {collectors = [], collecting = false,
                 start_clct_time = " undefined~n", end_clct_time = " undefined~n", 
-                repo, transfered = 0}).      
+                repo, pulled = 0}).      
 
 -define(MAX_TRY_TIMES, 3).                      % max times to check cluster state
 -define(LOCAL_SERVER, akita_collector_local).
@@ -80,34 +80,9 @@ handle_info(local_init, State) ->
     LocalCollectors = start_local_servers(nodes(connected)), 
     {noreply, State#state{collectors = LocalCollectors}}; 
 
-handle_info({'DOWN', Ref, process, _Pid, _Info}, #state{collectors = Collectors, collecting = IsWorking} = State) ->
-    [OldCollector] = [{N, R} || {N, R} <- Collectors, R =:= Ref],
-    {DownNode, _OldRef} = OldCollector,
-    error_logger:error_msg("collector on node (~w) goes on strike~n", [DownNode]),
-    NewCollectors0 = Collectors -- [OldCollector],
-    {ok, NewPid} = rpc:call(DownNode, ?LOCAL_SERVER, start_link, [self(), reboot, init_config()]),
-    case IsWorking of 
-        true ->
-            timer:sleep(500),
-            rpc:call(DownNode, ?LOCAL_SERVER, start_collect, []);
-        _ -> ok
-    end,
-    NewCollectors 
-        = receive
-              {local_reboot, {DownNode, ok}} ->
-                  error_logger:info_msg("collector on node (~w) goes back to work~n", [DownNode]),
-                  MonitorRef = erlang:monitor(process, NewPid),
-                  NewCollectors0 ++ [{DownNode, MonitorRef}];
-              {local_reboot, {DownNode, fail}} ->
-                  %% if NewPid is not alive, it is to say that DownNode may be unavailable.
-                  %% so there is no need to restart the collector on that node.
-                  error_logger:error_msg("collector on node (~w) goes home~n", [DownNode]),
-                  NewCollectors0
-          after
-              5000 ->
-                  error_logger:error_msg("collector on node (~w) goes home (timeout)~n", [DownNode]),
-                  NewCollectors0
-          end,
+handle_info({'DOWN', Ref, process, _Pid, _Info}, #state{collectors = Collectors, 
+                                                        collecting = Boolean} = State) ->
+    NewCollectors = update_collectors(Ref, Collectors, Boolean),
     {noreply, State#state{collectors = NewCollectors}};
 
 handle_info(start_collect, #state{collectors = []} = State) ->
@@ -179,35 +154,25 @@ handle_info(pull, #state{collecting = false, collectors = Collectors} = State) -
     Repo = filename:join(Home, DirName),
     file:make_dir(Repo),
     [rpc:call(N, ?LOCAL_SERVER, pull, [self()]) || {N, _} <- Collectors],
-    {noreply, State#state{repo = Repo, transfered = 0}};
+    {noreply, State#state{repo = Repo, pulled = 0}};
 
 handle_info({pull_ack, From, FileName}, #state{repo = Repo} = State) ->
-    {ok, Listen} = gen_tcp:listen(0, [binary, {packet, raw}, {active, false}]),
-    {ok, Hostname} = inet:gethostname(),
-    {ok, Port} = inet:port(Listen),
-    Hub = self(),
-    SaveFile = filename:join(Repo, FileName),
-    proc_lib:spawn(fun() ->
-                           case gen_tcp:accept(Listen, 5000) of
-                               {ok, Sock} ->
-                                   {ok, IoDevice} = file:open(SaveFile, [write, binary]),
-                                   recv_sock(Sock, IoDevice, Hub, FileName);
-                                {error, Reason} ->
-                                   error_logger:error_msg("~p can not be retrieved (~w) ~n", [FileName, Reason])
-                           end
-                   end),
-    timer:sleep(500),
-    From ! {trans_req, {Hostname, Port}},
+    pull_req(Repo, FileName, From),
     {noreply, State};
 
-handle_info(retrieved, #state{transfered = Done, collectors = Collectors} = State) ->
+handle_info(pulled, #state{pulled = NumOfPulled, collectors = Collectors, repo = Repo} = State) ->
     if
-        (Done + 1) =:= length(Collectors) ->
-            error_logger:info_msg("data on all nodes transfered~n", []);
+        (NumOfPulled + 1) =:= length(Collectors) ->
+            error_logger:info_msg("pulling done, archive at: ~p ~n", [Repo]);
         true ->
             ok
     end,
-    {noreply, State#state{transfered = Done + 1}};
+    {noreply, State#state{pulled = NumOfPulled + 1}};
+
+handle_info({'EXIT', Pid, Reason}, State) ->    % this clause is used to check the status of the proc
+                                                % which is sent out to retrieve data on every node.
+    error_logger:info_msg("receive EXIT signal from ~w (~w) ~n", [Pid, Reason]),
+    {noreply, State};
 
 handle_info(Info, State) ->
     error_logger:error_msg("receive unexpected info: ~p~n", [Info]),
@@ -329,10 +294,62 @@ recv_sock(Sock, IoDevice, Hub, FileName) ->
         {error, closed} ->
             file:close(IoDevice),
             gen_tcp:close(Sock),
-            Hub ! retrieved,
-            error_logger:info_msg("~p retrieved ~n", [FileName]);
+            Hub ! pulled,
+            error_logger:info_msg("~p pulled ~n", [FileName]);
         {error, Reason} ->
             file:close(IoDevice),
             gen_tcp:close(Sock),
-            error_logger:error_msg("~p can not be retrieved (~p) ~n", [FileName, Reason])
+            error_logger:error_msg("~p can not be pulled (~p) ~n", [FileName, Reason])
     end.
+
+pull_req(Repo, FileName, From) ->
+    {ok, Hostname} = inet:gethostname(),
+    {ok, Listen} = gen_tcp:listen(0, [binary, {packet, raw}, {active, false}]),
+    {ok, Port} = inet:port(Listen),
+    Hub = self(),
+    SaveFile = filename:join(Repo, FileName),
+    proc_lib:spawn_link(fun() -> accept_and_recv(Listen, SaveFile, Hub, FileName) end),
+    timer:sleep(500),
+    From ! {pull_req, {Hostname, Port}},
+    ok.
+
+accept_and_recv(Listen, SaveFile, Hub, FileName) ->
+    case gen_tcp:accept(Listen, 5000) of
+        {ok, Sock} ->
+            gen_tcp:close(Listen),
+            {ok, IoDevice} = file:open(SaveFile, [write, binary]),
+            recv_sock(Sock, IoDevice, Hub, FileName);
+        {error, Reason} ->
+            error_logger:error_msg("~p can not be pulled (~w) ~n", [FileName, Reason])
+    end.
+
+update_collectors(Ref, Collectors, NeedRestartCollect) ->
+    [OldCollector] = [{N, R} || {N, R} <- Collectors, R =:= Ref],
+    {DownNode, _OldRef} = OldCollector,
+    error_logger:error_msg("collector on node (~w) goes on strike~n", [DownNode]),
+    NewCollectors0 = Collectors -- [OldCollector],
+    {ok, NewPid} = rpc:call(DownNode, ?LOCAL_SERVER, start_link, [self(), reboot, init_config()]),
+    %% check whether i need restart collecting
+    case NeedRestartCollect of 
+        true ->
+            timer:sleep(500),
+            rpc:call(DownNode, ?LOCAL_SERVER, start_collect, []);
+        _ -> ok
+    end,
+    receive
+        {local_reboot, {DownNode, ok}} ->
+            error_logger:info_msg("collector on node (~w) goes back to work~n", [DownNode]),
+            MonitorRef = erlang:monitor(process, NewPid),
+            NewCollectors0 ++ [{DownNode, MonitorRef}];
+        {local_reboot, {DownNode, fail}} ->
+            %% if NewPid is not alive, it is to say that DownNode may be unavailable.
+            %% so there is no need to restart the collector on that node.
+            error_logger:error_msg("collector on node (~w) goes home~n", [DownNode]),
+            NewCollectors0
+    after
+        5000 ->
+            error_logger:error_msg("collector on node (~w) goes home (timeout)~n", [DownNode]),
+            NewCollectors0
+    end.
+
+    
