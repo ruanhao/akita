@@ -6,6 +6,6 @@
     {applications, [kernel, stdlib]},
     {registered, [akita_cluster_info, akita_collector_local]},
     {mod, {akita_app, []}},
-    {env, [{interval, 60000}, 
+    {env, [{interval, 100}, 
            {topn, 5}, 
-           {smp, true}]}]}.
+           {smp, false}]}]}.

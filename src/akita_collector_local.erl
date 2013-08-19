@@ -12,7 +12,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/3, start_collect/0, stop_collect/0, quit/0, pull/1]).
+-export([start_link/4, start_collect/0, stop_collect/0, quit/0, pull/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -39,8 +39,8 @@
 %% @spec start_link() -> {ok, Pid} | ignore | {error, Error}
 %% @end
 %%--------------------------------------------------------------------
-start_link(From, Flag, Paras) ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [From, Flag, Paras], []).
+start_link(From, Flag, Paras, OffL) ->
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [From, Flag, Paras, OffL], []).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -68,7 +68,18 @@ quit() ->
 %%                     {stop, Reason}
 %% @end
 %%--------------------------------------------------------------------
-init([From, boot, Paras]) ->
+init([From, boot, _Paras, true]) ->
+    error_logger:info_msg("start local init on node (~w) offline ~n", [node()]),
+    From ! {local_init, {node(), ok}},
+    {ok, #state{}};
+
+init([From, reboot, _Paras, true]) ->
+    error_logger:info_msg("reboot local init on node (~w) offline ~n", [node()]),
+    From ! {local_reboot, {node(), ok}},
+    {ok, #state{}};
+    
+init([From, boot, Paras, false]) ->
+    %% process_flag(trap_exit, true),              % trap 'EXIT' signal when cpu_sup and memsup quit
     error_logger:info_msg("start local init on node (~w)~n", [node()]),
     remove_old_dets(),
     %% just create a new dets file here,
@@ -77,8 +88,8 @@ init([From, boot, Paras]) ->
     create_new_dets(From, local_init),
     {ok, init_config(Paras)};
 
-init([From, reboot, Paras]) ->
-    error_logger:info_msg("restart local init on node (~w)~n", [node()]),
+init([From, reboot, Paras, false]) ->
+    error_logger:info_msg("reboot local init on node (~w)~n", [node()]),
     %% in case of there is no such file,
     %% the possibility is very small.
     create_new_dets(From, local_reboot),
@@ -143,7 +154,8 @@ handle_info(period_collect, #state{working = false} = State) ->
 
 handle_info(stop_collect, State) ->
     dets:close(?MODULE),
-    stop_sup(),
+    %% stop_sup(),      %% in case there is alreay cpu_sup 
+                        %% and memsup before akita is deployed
     error_logger:info_msg("stop collecting info on node (~w)~n", [node()]),
     dump_mailbox(),
     {noreply, State#state{working = false}};
@@ -184,6 +196,7 @@ handle_info(_Info, State) ->
 %% @end
 %%--------------------------------------------------------------------
 terminate(_Reason, _State) ->
+    %% error_logger:info_msg("collector proc terminates ~n", []),
     dets:close(?MODULE),                        % in order to save file
     stop_sup(),
     ok.
@@ -354,5 +367,20 @@ start_sup() ->
     memsup:start_link().
 
 stop_sup() ->
-    cpu_sup:stop(),
-    exit(whereis(memsup), normal).
+    case is_pid_and_alive(whereis(cpu_sup)) of
+        true -> cpu_sup:stop();
+        false -> ok
+    end,
+    case is_pid_and_alive(whereis(memsup)) of
+        true -> exit(whereis(memsup), normal);
+        false -> ok
+    end.
+
+is_pid_and_alive(Pid) ->
+    case is_pid(Pid) of
+        true ->
+            is_process_alive(Pid);
+        false ->
+            false
+    end.
+            

@@ -30,14 +30,15 @@
 % doing job now. 
 -record(state, {collectors = [], collecting = false,
                 start_clct_time = " undefined~n", end_clct_time = " undefined~n", 
-                repo, pulled = 0}).      
+                repo, pulled = 0, 
+                offline = false}).      
 
 -define(MAX_TRY_TIMES, 3).                      % max times to check cluster state
 -define(LOCAL_SERVER, akita_collector_local).
 -define(LOCAL_SERVER_MODULE, ?LOCAL_SERVER).
 
 %% API Function
--export([start_link/0]).
+-export([start_link/0, start_link/1]).
 
 %% Behaviour Callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
@@ -48,11 +49,20 @@
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
+start_link(offline) ->                          % just for pulling
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [offline], []).
 %% ------------------------------------------------------------------
 %% Behaviour Callbacks
 %% ------------------------------------------------------------------
+init([offline]) ->
+    error_logger:info_msg("initialize akita (offline) ~n", []),
+    %% in order to call terminate when application stops
+    process_flag(trap_exit, true),
+    lazy_do(check_meshed),
+    {ok, #state{offline = true}};
+
 init([]) ->
-    error_logger:info_msg("initialize akita~n", []),
+    error_logger:info_msg("initialize akita ~n", []),
     %% in order to call terminate when application stops
     process_flag(trap_exit, true),
     lazy_do(check_meshed),
@@ -74,19 +84,30 @@ handle_info(load_mod, State) ->
     lazy_do(local_init),
     {noreply, State};
 
-handle_info(local_init, State) -> 
+handle_info(local_init, #state{offline = OffL} = State) -> 
     error_logger:info_msg("start to init on local nodes~n", []),
     servers_prepare(),
-    LocalCollectors = start_local_servers(nodes(connected)), 
+    LocalCollectors = start_local_servers(nodes(connected), OffL), 
     {noreply, State#state{collectors = LocalCollectors}}; 
 
-handle_info({'DOWN', Ref, process, _Pid, _Info}, #state{collectors = Collectors, 
-                                                        collecting = Boolean} = State) ->
-    NewCollectors = update_collectors(Ref, Collectors, Boolean),
+handle_info({'DOWN', Ref, process, _Pid, Info}, #state{collectors = Collectors, 
+                                                        collecting = Boolean, offline = OffL} = State) ->
+    case Info of
+        noconnection ->
+            timer:sleep(500),
+            check_cluster_meshed(?MAX_TRY_TIMES);
+        noproc ->
+            ok
+    end,
+    NewCollectors = update_collectors(Ref, Collectors, Boolean, OffL),
     {noreply, State#state{collectors = NewCollectors}};
 
 handle_info(start_collect, #state{collectors = []} = State) ->
     error_logger:error_msg("there are no collectors at all~n", []),
+    {noreply, State};
+
+handle_info(start_collect, #state{offline = true} = State) ->
+    error_logger:error_msg("hey, you are in offline mode, don't play on me -_-# ~n", []),
     {noreply, State};
 
 handle_info(start_collect, #state{collecting = true} = State) ->
@@ -115,18 +136,21 @@ handle_info(stop_collect, #state{collectors = Collectors} = State) ->
     {noreply, State#state{collecting = false, end_clct_time = get_current_time()}};
 
 handle_info(status, #state{collectors = Collectors, collecting = IsWorking, 
-                           start_clct_time = StartTime, end_clct_time = EndTime} = State) ->
+                           start_clct_time = StartTime, end_clct_time = EndTime, 
+                           offline = OffL} = State) ->
     SplitLine = "----------------------------~n",
     WorkingNodes = [io_lib:format("~w~n", [N]) || {N, _} <- Collectors],
     WorkingNodesStr = lists:flatten(WorkingNodes),
     Configs = [io_lib:format("~w: ~w~n", [K, V]) || {K, V} <- init_config()],
     ConfigsStr = lists:flatten(Configs),
     IsWorkingStr = io_lib:format("~w~n", [IsWorking]),
+    OffLStr = atom_to_list(OffL) ++ "\n",
     error_logger:info_msg("CURRENT COLLECTORS: ~n" ++ WorkingNodesStr ++ SplitLine ++ 
                               "IS COLLECTING NOW: ~n" ++ IsWorkingStr ++ SplitLine ++
                               "START COLLECTING: ~n" ++ StartTime ++ 
                               "STOP COLLECTING: ~n" ++ EndTime ++ SplitLine ++ 
-                              "CONFIGS: ~n" ++ ConfigsStr ++ SplitLine, []),
+                              "CONFIGS: ~n" ++ ConfigsStr ++ SplitLine ++ 
+                              "OFFLINE: ~n" ++ OffLStr, []),
     {noreply, State};
 
 handle_info({From, stop}, #state{collectors = Collectors} = State) ->
@@ -183,7 +207,7 @@ terminate(shutdown, _State) ->
     ok;
 
 terminate(Reason, _State) ->
-    error_logger:error_msg("akita crashes with reason: ~w~n", [Reason]),
+    error_logger:error_msg("akita crashes with reason: ~p~n", [Reason]),
     mesh_unload0(nodes(connected)),
     ok.
 
@@ -205,20 +229,20 @@ mesh_unload1(Collectors) ->
          rpc:call(N, code, delete, [?LOCAL_SERVER_MODULE])
      end || {N, _M} <- Collectors].
 
-start_local_servers(Nodes) ->
-    start_local_servers(Nodes, []).
+start_local_servers(Nodes, OffL) ->
+    start_local_servers(Nodes, [], OffL).
 
-start_local_servers([], Collectors) -> 
+start_local_servers([], Collectors, _) -> 
     error_logger:info_msg("local init on all nodes successfully~n", []),
     Collectors;
 
-start_local_servers([H | T], Collectors) ->
-    {ok, Pid} = rpc:call(H, ?LOCAL_SERVER, start_link, [self(), boot, init_config()]),
+start_local_servers([H | T], Collectors, OffL) ->
+    {ok, Pid} = rpc:call(H, ?LOCAL_SERVER, start_link, [self(), boot, init_config(), OffL]),
     receive
         {local_init, {Node, ok}} ->
             error_logger:info_msg("local init on node (~w) successfully~n", [Node]),
             Ref = erlang:monitor(process, Pid),
-            start_local_servers(T, [{H, Ref} | Collectors]);
+            start_local_servers(T, [{H, Ref} | Collectors], OffL);
         {local_init, {Node, fail}} ->
             Msg = io_lib:format("local init on node (" ++ atom_to_list(Node) ++ ") unsuccessfully", []),
             exit(Msg)
@@ -323,22 +347,28 @@ accept_and_recv(Listen, SaveFile, Hub, FileName) ->
             error_logger:error_msg("~p can not be pulled (~w) ~n", [FileName, Reason])
     end.
 
-update_collectors(Ref, Collectors, NeedRestartCollect) ->
+update_collectors(Ref, Collectors, NeedRestartCollect, OffL) ->
     [OldCollector] = [{N, R} || {N, R} <- Collectors, R =:= Ref],
     {DownNode, _OldRef} = OldCollector,
     error_logger:error_msg("collector on node (~w) goes on strike~n", [DownNode]),
     NewCollectors0 = Collectors -- [OldCollector],
-    {ok, NewPid} = rpc:call(DownNode, ?LOCAL_SERVER, start_link, [self(), reboot, init_config()]),
-    %% check whether i need restart collecting
-    case NeedRestartCollect of 
-        true ->
-            timer:sleep(500),
-            rpc:call(DownNode, ?LOCAL_SERVER, start_collect, []);
-        _ -> ok
-    end,
+    NewPid = 
+        case rpc:call(DownNode, ?LOCAL_SERVER, start_link, [self(), reboot, init_config(), OffL]) of
+            {ok, P} -> 
+                %% check whether i need restart collecting
+                case NeedRestartCollect of 
+                    true ->
+                        timer:sleep(500),
+                        rpc:call(DownNode, ?LOCAL_SERVER, start_collect, []);
+                    _ -> ok
+                end,
+                P;
+            {badrpc,nodedown} -> 
+                null
+        end,
     receive
         {local_reboot, {DownNode, ok}} ->
-            error_logger:info_msg("collector on node (~w) goes back to work~n", [DownNode]),
+            error_logger:info_msg("collector on node (~w) goes back to work ~n", [DownNode]),
             MonitorRef = erlang:monitor(process, NewPid),
             NewCollectors0 ++ [{DownNode, MonitorRef}];
         {local_reboot, {DownNode, fail}} ->
@@ -348,7 +378,12 @@ update_collectors(Ref, Collectors, NeedRestartCollect) ->
             NewCollectors0
     after
         5000 ->
-            error_logger:error_msg("collector on node (~w) goes home (timeout)~n", [DownNode]),
+            case NewPid of
+                null -> 
+                    error_logger:error_msg("collector on node (~w) goes home (node down)~n", [DownNode]);
+                _ ->
+                    error_logger:error_msg("collector on node (~w) goes home (timeout)~n", [DownNode])
+            end,
             NewCollectors0
     end.
 
