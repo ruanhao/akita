@@ -107,7 +107,7 @@ output(FileName) ->
     {ok, ?MODULE} = dets:open_file(?MODULE, [{file, FileName}, {access, read}]),
     {ok, TxtFd} = file:open(FileName ++ ".txt", [write]),
     {ok, CsvFd} = file:open(FileName ++ ".csv", [write]),
-    Split = "####################################################################################~n",
+    Split = "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -~n",
     io:format(CsvFd, "time,cpu_util,mem_util~n", []),
     io:format(TxtFd, "welcome to akita data centre~n", []),
     dets:traverse(?MODULE, fun({{epoch, {_, {H, M, S}}}, _, {cpu_util, CpuUtil}, {mem_util, MemUtil},
