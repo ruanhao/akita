@@ -69,7 +69,11 @@ Sample
  {red_toplist,[<7181.3.0>,<7181.25.0>,<7181.11.0>,<7181.67.0>,<7181.40.0>]},
  {mq_toplist,[<7181.80.0>,<7181.79.0>,<7181.78.0>,<7181.77.0>,<7181.76.0>]},
  {procs_info, ... %% omitted
-```
+```  
+#### .csv:  
+akita provides csv file to observe CPU and memory visually  
+When there is something suspect, you can trace it in corresponding txt file by the clue of **epoch**
+![csv][1]  
 
 Acknowledge
 -----------
@@ -83,3 +87,4 @@ You owe me a cup of Pepsi
   [westminster]:  https://github.com/ruanhao/westminster.git
   [see how]:  https://github.com/ruanhao/westminster.git
   [Donate]:  https://www.paypal.com/en_US/i/btn/btn_donate_SM.gif
+  [1]:  https://raw.github.com/ruanhao/akita/master/sample/sample.png
