@@ -59,6 +59,29 @@ in akita/src/akita.app.src:
 
 Sample
 ------
+#### shell console
+```shell
+=INFO REPORT==== 24-Jan-2014::09:50:30 ===
+CURRENT COLLECTORS: 
+hello@hao
+----------------------------
+IS COLLECTING NOW: 
+true
+----------------------------
+START COLLECTING: 
+ 1/24/2014  9:50:18
+STOP COLLECTING: 
+ undefined
+----------------------------
+CONFIGS: 
+interval: 1000
+topn: 5
+smp: true
+----------------------------
+OFFLINE: 
+false
+ok
+```
 #### .txt:  
 ```erlang
 {{epoch,{{2013,8,19},{20,50,31}}},
